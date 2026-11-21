@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Rust 编译产物（体积大，不入库）
+src-tauri/target/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 微信解密相关：密钥、凭据、临时产物一律不入库
+secrets/
+*credentials*.json
+wechat-credentials.json
+work/
+src-tauri/sidecar/__pycache__/
+*.pyc
+
+# 解密后的数据库 / 导出数据
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
