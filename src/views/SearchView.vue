@@ -2,6 +2,10 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { api } from "../api";
 import BasketDrawer from "../components/BasketDrawer.vue";
+import ImageLightbox from "../components/ImageLightbox.vue";
+import MessageEmoticon from "../components/MessageEmoticon.vue";
+import MessageImage from "../components/MessageImage.vue";
+import { avatarInitial, avatarUrl, ensureAvatars, ensureAvatarsFor } from "../stores/avatars";
 import { basket, basketIdSet, refreshBasket, toggleBasket } from "../stores/basket";
 import { notify } from "../toast";
 import type {
@@ -13,6 +17,7 @@ import type {
   SearchItem,
 } from "../types";
 import { formatTime, splitHighlight, TYPE_LABEL } from "../utils";
+import { replaceWechatEmoji } from "../wechatEmoji";
 
 const LIMIT = 50;
 
@@ -44,11 +49,12 @@ const searched = ref(false);
 const contextItems = ref<Message[]>([]);
 const contextTarget = ref<Message | null>(null);
 const contextLoading = ref(false);
+const previewMd5 = ref("");
 
 let timer: number | undefined;
 let requestSeq = 0;
 
-const TYPE_ORDER: MessageType[] = ["text", "quote", "image", "file"];
+const TYPE_ORDER: MessageType[] = ["text", "quote", "image", "file", "emoticon"];
 
 const filteredGroups = computed(() => {
   const query = groupQuery.value.trim().toLowerCase();
@@ -162,6 +168,7 @@ async function runSearch() {
     if (seq !== requestSeq) return;
     results.value = data.items;
     total.value = data.total;
+    ensureAvatarsFor(data.items.map((item) => item.senderId));
     if (page.value > 0 && page.value * LIMIT >= data.total) {
       page.value = Math.max(0, Math.ceil(data.total / LIMIT) - 1);
       await runSearch();
@@ -193,6 +200,8 @@ function syncBasketFlags() {
   for (const item of results.value) {
     item.inBasket = basketIdSet.value.has(item.id);
   }
+  // 「已选消息」筛选下移出已选后，当前列表和总数需要重新拉取。
+  if (inBasketOnly.value) void runSearch();
 }
 
 async function toggle(item: SearchItem) {
@@ -241,11 +250,15 @@ async function openContext(item: SearchItem) {
   contextItems.value = [];
   contextLoading.value = true;
   try {
-    contextItems.value = await api.messageContext(item.id, 8);
+    const items = await api.messageContext(item.id, 8);
+    // 连续点击不同消息时，只接受最后一次请求的结果。
+    if (contextTarget.value?.id !== item.id) return;
+    contextItems.value = items;
+    ensureAvatarsFor(items.map((message) => message.senderId));
   } catch (error) {
     notify(String(error), "error");
   } finally {
-    contextLoading.value = false;
+    if (contextTarget.value?.id === item.id) contextLoading.value = false;
   }
 }
 
@@ -256,7 +269,7 @@ function closeContext() {
 
 onMounted(async () => {
   try {
-    await refreshBasket();
+    await Promise.all([refreshBasket(), ensureAvatars()]);
     const [groupList, personList] = await Promise.all([
       api.listGroups(true),
       api.searchPeople("", true),
@@ -422,6 +435,10 @@ onBeforeUnmount(() => {
             @click.stop
             @change="toggle(item)"
           />
+          <span class="msg-avatar">
+            <img v-if="avatarUrl(item.senderId)" :src="avatarUrl(item.senderId)" alt="" />
+            <span v-else>{{ avatarInitial(item.senderName) }}</span>
+          </span>
           <div class="msg-main">
             <div class="msg-top">
               <span class="sender">
@@ -435,16 +452,29 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <div v-if="item.quotedContent" class="quote-block">
-              引用 {{ item.quotedSender }}：{{ item.quotedContent }}
+              引用 {{ item.quotedSender }}：{{ replaceWechatEmoji(item.quotedContent) }}
             </div>
-            <div v-if="item.type === 'image'" class="image-chip">
+            <MessageEmoticon
+              v-if="item.type === 'emoticon' && item.emoticonMd5"
+              :message-id="item.id"
+              :md5="item.emoticonMd5"
+            />
+            <MessageImage
+              v-else-if="item.type === 'image' && item.imageMd5"
+              :md5="item.imageMd5"
+              @preview="previewMd5 = $event"
+            />
+            <div v-else-if="item.type === 'image'" class="image-chip">
               图片 · {{ item.fileName }}
             </div>
             <div v-else-if="item.type === 'file'" class="file-chip">
               文件 · {{ item.fileName }}
               <span class="size">{{ item.fileSize }}</span>
             </div>
-            <div v-if="item.content" class="msg-content">
+            <div
+              v-if="item.content && !(item.type === 'emoticon' && item.emoticonMd5)"
+              class="msg-content"
+            >
               <template v-for="(part, index) in highlighted(item.content)" :key="index">
                 <mark v-if="part.mark">{{ part.text }}</mark>
                 <template v-else>{{ part.text }}</template>
@@ -487,31 +517,58 @@ onBeforeUnmount(() => {
             class="context-item"
             :class="{ hit: message.id === contextTarget.id }"
           >
-            <div class="context-meta">
-              <span class="sender">{{ message.senderName }}</span>
-              <span>{{ formatTime(message.createdAt) }}</span>
-            </div>
-            <div v-if="message.quotedContent" class="quote-block">
-              引用 {{ message.quotedSender }}：{{ message.quotedContent }}
-            </div>
-            <div v-if="message.type === 'image'" class="image-chip">
-              图片 · {{ message.fileName }}
-            </div>
-            <div v-else-if="message.type === 'file'" class="file-chip">
-              文件 · {{ message.fileName }}
-              <span class="size">{{ message.fileSize }}</span>
-            </div>
-            <div v-if="message.content" class="context-text">
-              <template v-if="message.id === contextTarget.id">
-                <template
-                  v-for="(part, index) in splitHighlight(message.content, keyword.trim())"
-                  :key="index"
+            <div class="context-row">
+              <span class="list-avatar">
+                <img
+                  v-if="avatarUrl(message.senderId)"
+                  :src="avatarUrl(message.senderId)"
+                  alt=""
+                />
+                <span v-else>{{ avatarInitial(message.senderName) }}</span>
+              </span>
+              <div class="context-main">
+                <div class="context-meta">
+                  <span class="sender">{{ message.senderName }}</span>
+                  <span>{{ formatTime(message.createdAt) }}</span>
+                </div>
+                <div v-if="message.quotedContent" class="quote-block">
+                  引用 {{ message.quotedSender }}：{{
+                    replaceWechatEmoji(message.quotedContent)
+                  }}
+                </div>
+                <MessageEmoticon
+                  v-if="message.type === 'emoticon' && message.emoticonMd5"
+                  :message-id="message.id"
+                  :md5="message.emoticonMd5"
+                />
+                <MessageImage
+                  v-else-if="message.type === 'image' && message.imageMd5"
+                  :md5="message.imageMd5"
+                  @preview="previewMd5 = $event"
+                />
+                <div v-else-if="message.type === 'image'" class="image-chip">
+                  图片 · {{ message.fileName }}
+                </div>
+                <div v-else-if="message.type === 'file'" class="file-chip">
+                  文件 · {{ message.fileName }}
+                  <span class="size">{{ message.fileSize }}</span>
+                </div>
+                <div
+                  v-if="message.content && !(message.type === 'emoticon' && message.emoticonMd5)"
+                  class="context-text"
                 >
-                  <mark v-if="part.mark">{{ part.text }}</mark>
-                  <template v-else>{{ part.text }}</template>
-                </template>
-              </template>
-              <template v-else>{{ message.content }}</template>
+                  <template v-if="message.id === contextTarget.id">
+                    <template
+                      v-for="(part, index) in splitHighlight(message.content, keyword.trim())"
+                      :key="index"
+                    >
+                      <mark v-if="part.mark">{{ part.text }}</mark>
+                      <template v-else>{{ part.text }}</template>
+                    </template>
+                  </template>
+                  <template v-else>{{ replaceWechatEmoji(message.content) }}</template>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -525,5 +582,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
+
+    <ImageLightbox v-if="previewMd5" :md5="previewMd5" @close="previewMd5 = ''" />
   </div>
 </template>

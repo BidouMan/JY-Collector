@@ -32,6 +32,14 @@ use std::time::{Duration, Instant};
 const KEYCHAIN_SERVICE: &str = "jycollector.wechat.key";
 const KEYCHAIN_ACCOUNT: &str = "wechat-macos";
 
+/// Windows 版尚未实现本机微信数据源（取密钥、解密、权限流程都在 macOS 侧）。
+/// 返回统一的友好提示，让界面显示一条简洁说明而不是多层报错。
+#[cfg(target_os = "windows")]
+const SOURCE_UNAVAILABLE: Option<&str> =
+    Some("Windows 版暂不支持读取本机微信数据，其他功能可正常使用");
+#[cfg(not(target_os = "windows"))]
+const SOURCE_UNAVAILABLE: Option<&str> = None;
+
 pub struct SourceState {
     pub sidecar_dir: PathBuf,
     pub status: Mutex<SourceStatusDto>,
@@ -74,7 +82,7 @@ const CHECK_DEBOUNCE: Duration = Duration::from_secs(20);
 /// 两次增量解密之间的最小间隔。
 const CHECK_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
-fn default_db_root() -> PathBuf {
+pub(crate) fn default_db_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     Path::new(&home)
         .join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
@@ -257,6 +265,9 @@ pub fn session_last_timestamps(
     account: &str,
     watched: &[String],
 ) -> Result<HashMap<String, i64>, String> {
+    if let Some(message) = SOURCE_UNAVAILABLE {
+        return Err(message.to_string());
+    }
     let key_hex = load_key_hex()?;
     let request = serde_json::json!({
         "probe": "session",
@@ -273,11 +284,16 @@ pub fn session_last_timestamps(
     serde_json::from_value(stamps).map_err(|_| "会话库结果解析失败".to_string())
 }
 
-/// 只解头像库，返回微信里的联系人与群头像（不读消息库、不写库）。
-pub fn avatar_snapshot(
-    sidecar_dir: &Path,
-    account: &str,
-) -> Result<Vec<crate::models::WxAvatarInput>, String> {
+pub struct AvatarSnapshot {
+    pub avatars: Vec<crate::models::WxAvatarInput>,
+    pub urls: Vec<crate::models::WxAvatarUrlInput>,
+}
+
+/// 只解头像库与联系人库，返回本地头像与头像 CDN 地址（不读消息库、不写库）。
+pub fn avatar_snapshot(sidecar_dir: &Path, account: &str) -> Result<AvatarSnapshot, String> {
+    if let Some(message) = SOURCE_UNAVAILABLE {
+        return Err(message.to_string());
+    }
     let key_hex = load_key_hex()?;
     let request = serde_json::json!({
         "probe": "avatars",
@@ -290,7 +306,11 @@ pub fn avatar_snapshot(
         .get("avatars")
         .cloned()
         .ok_or_else(|| "头像结果缺少字段".to_string())?;
-    serde_json::from_value(avatars).map_err(|_| "头像结果解析失败".to_string())
+    let urls = value.get("avatarUrls").cloned().unwrap_or_else(|| serde_json::json!([]));
+    Ok(AvatarSnapshot {
+        avatars: serde_json::from_value(avatars).map_err(|_| "头像结果解析失败".to_string())?,
+        urls: serde_json::from_value(urls).map_err(|_| "头像地址解析失败".to_string())?,
+    })
 }
 
 fn credentials_path() -> Option<PathBuf> {
@@ -412,13 +432,16 @@ fn run_sidecar_json(
 }
 
 /// 解码管线版本。规则/解码逻辑变更时递增，下次同步会自动全量重读并覆盖旧行。
-const PIPELINE_VERSION: &str = "3";
+const PIPELINE_VERSION: &str = "5";
 
 /// 解密 -> 归一化 -> 增量落库。返回本次同步的统计信息。
 pub fn sync(
     conn: &mut rusqlite::Connection,
     sidecar_dir: &Path,
 ) -> Result<SyncSummaryDto, String> {
+    if let Some(message) = SOURCE_UNAVAILABLE {
+        return Err(message.to_string());
+    }
     let started = std::time::Instant::now();
     let key_hex = load_key_hex()?;
 
@@ -444,6 +467,7 @@ pub fn sync(
         &exported.groups,
         &exported.messages,
         &exported.avatars,
+        &exported.avatar_urls,
     )
     .map_err(|e| format!("写入本地库失败：{}", e))?;
     crate::db::save_setting(conn, "wechat_pipeline_version", PIPELINE_VERSION)

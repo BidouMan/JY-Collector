@@ -9,6 +9,8 @@ pub struct GroupDto {
     pub message_count: i64,
     pub record_count: i64,
     pub last_at: Option<String>,
+    /// 会话类型：group（群聊）或 private（单聊）
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +29,11 @@ pub struct MessageDto {
     pub quoted_sender: Option<String>,
     pub file_name: Option<String>,
     pub file_size: Option<String>,
+    /// 图片消息对应的本地 .dat 文件 md5（非图片为空）
+    pub image_md5: Option<String>,
+    pub emoticon_md5: Option<String>,
+    pub emoticon_url: Option<String>,
+    pub emoticon_key: Option<String>,
     pub created_at: String,
 }
 
@@ -51,6 +58,8 @@ pub struct PersonDto {
     pub message_count: i64,
     pub group_names: String,
     pub last_at: Option<String>,
+    /// 是否已加入关注
+    pub is_followed: bool,
 }
 
 /// 高级检索条件。字段留空表示不限制。
@@ -232,6 +241,22 @@ fn default_header_row() -> i64 {
     1
 }
 
+/// 数据管理页「列设置」保存时的一列。
+/// `source` 是这一列在调整前的 Excel 列号；0 表示新增列。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetColumnInput {
+    #[serde(default)]
+    pub source: u32,
+    pub label: String,
+    #[serde(default)]
+    pub hint: String,
+    #[serde(default = "default_column_width")]
+    pub width: u32,
+    #[serde(default = "default_column_format")]
+    pub format: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendReportDto {
@@ -285,6 +310,9 @@ pub struct WxGroupInput {
     pub member_count: i64,
     /// Unix 秒；没有活跃记录时为 null
     pub last_active: Option<i64>,
+    /// sidecar 未提供时按群聊处理
+    #[serde(default)]
+    pub kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +329,14 @@ pub struct WxMessageInput {
     pub quoted_content: Option<String>,
     pub file_name: Option<String>,
     pub file_size: Option<String>,
+    #[serde(default)]
+    pub image_md5: Option<String>,
+    #[serde(default)]
+    pub emoticon_md5: Option<String>,
+    #[serde(default)]
+    pub emoticon_url: Option<String>,
+    #[serde(default)]
+    pub emoticon_key: Option<String>,
     /// Unix 秒
     pub created_at: i64,
 }
@@ -322,6 +358,29 @@ pub struct AvatarDto {
     pub data: String,
 }
 
+/// 没有本地头像缓存时的 CDN 地址（群成员也能覆盖到）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WxAvatarUrlInput {
+    pub entity_id: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarUrlDto {
+    pub entity_id: String,
+    pub url: String,
+}
+
+/// 图片消息解码结果：data 为图片 base64（不含 data: 前缀）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagePayloadDto {
+    pub mime: String,
+    pub data: String,
+}
+
 /// sidecar 输出的整体结构
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -331,6 +390,8 @@ pub struct WxExport {
     pub messages: Vec<WxMessageInput>,
     #[serde(default)]
     pub avatars: Vec<WxAvatarInput>,
+    #[serde(default)]
+    pub avatar_urls: Vec<WxAvatarUrlInput>,
 }
 
 #[derive(Debug, Serialize)]

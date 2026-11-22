@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { open } from "@tauri-apps/plugin-dialog";
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Sortable from "sortablejs";
 import { api } from "../api";
+import DropdownSelect from "./DropdownSelect.vue";
 import { notify } from "../toast";
 import type { SheetInfo, Template } from "../types";
 
@@ -14,6 +15,15 @@ const savingTemplate = ref(false);
 const templateDeleteId = ref<string | null>(null);
 const sheets = ref<SheetInfo[]>([]);
 const loadingSheets = ref(false);
+const templateOptions = computed(() =>
+  templates.value.map((item) => ({
+    value: item.id,
+    label: `${item.name}${item.isDefault ? "（默认）" : ""}`,
+  })),
+);
+const sheetOptions = computed(() =>
+  sheets.value.map((item) => ({ value: item.name, label: item.name })),
+);
 const columnListRef = ref<HTMLElement | null>(null);
 let columnSortable: Sortable | null = null;
 let templateDeleteTimer: number | undefined;
@@ -141,8 +151,7 @@ function selectTemplate(template: Template) {
   void loadSheets(false);
 }
 
-function onTemplateSelect(event: Event) {
-  const id = (event.target as HTMLSelectElement).value;
+function onTemplateSelect(id: string) {
   const found = templates.value.find((item) => item.id === id);
   if (found) selectTemplate(found);
 }
@@ -325,15 +334,12 @@ onBeforeUnmount(() => {
         <div class="settings-control">
           <div class="inline-row export-name-row">
             <input v-model="templateDraft.name" class="field-input export-name-input" />
-            <select
-              :value="templateDraft.id"
-              class="field-input export-template-select"
+            <DropdownSelect
+              :model-value="templateDraft.id"
+              :options="templateOptions"
+              class="export-template-select"
               @change="onTemplateSelect"
-            >
-              <option v-for="item in templates" :key="item.id" :value="item.id">
-                {{ item.name }}{{ item.isDefault ? "（默认）" : "" }}
-              </option>
-            </select>
+            />
             <button class="btn small" @click="newTemplate">新建</button>
             <button class="btn small" @click="duplicateTemplate">复制</button>
             <button class="text-btn" :disabled="!templateDraft.id" @click="removeTemplate">
@@ -360,16 +366,12 @@ onBeforeUnmount(() => {
         <div class="settings-label">工作表</div>
         <div class="settings-control">
           <div class="inline-row">
-            <select
+            <DropdownSelect
               v-if="sheets.length > 0"
               v-model="templateDraft.sheetName"
-              class="field-input"
+              :options="sheetOptions"
               @change="onSheetChange"
-            >
-              <option v-for="sheet in sheets" :key="sheet.name" :value="sheet.name">
-                {{ sheet.name }}
-              </option>
-            </select>
+            />
             <input v-else v-model="templateDraft.sheetName" class="field-input" />
           </div>
         </div>

@@ -1,4 +1,4 @@
-export type MessageType = "text" | "image" | "file" | "quote";
+export type MessageType = "text" | "image" | "file" | "quote" | "emoticon";
 
 export interface Group {
   id: string;
@@ -7,6 +7,8 @@ export interface Group {
   messageCount: number;
   recordCount: number;
   lastAt: string | null;
+  /** group：群聊；private：单聊 */
+  kind: "group" | "private";
 }
 
 export interface Message {
@@ -22,6 +24,10 @@ export interface Message {
   quotedSender: string | null;
   fileName: string | null;
   fileSize: string | null;
+  /** 图片消息对应的本地文件 md5，用于按需解密预览 */
+  imageMd5: string | null;
+  /** 表情消息 md5，用于按需下载并缓存 */
+  emoticonMd5: string | null;
   createdAt: string;
 }
 
@@ -32,6 +38,12 @@ export interface Avatar {
   data: string;
 }
 
+/** 本地没有头像缓存时的 CDN 地址 */
+export interface AvatarUrl {
+  entityId: string;
+  url: string;
+}
+
 export interface Person {
   senderId: string;
   senderName: string;
@@ -39,6 +51,7 @@ export interface Person {
   messageCount: number;
   groupNames: string;
   lastAt: string | null;
+  isFollowed: boolean;
 }
 
 export interface CaptureScope {

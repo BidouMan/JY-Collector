@@ -37,7 +37,7 @@ const rows = computed(() => {
     return filteredGroups.value.map((group) => ({
       key: group.id,
       name: group.name,
-      meta: `${group.messageCount} 条`,
+      meta: `${group.kind === "private" ? "单聊" : "群聊"} · ${group.messageCount} 条`,
     }));
   }
   return filteredPeople.value.map((person) => ({
@@ -131,16 +131,16 @@ onMounted(async () => {
         <div class="scope-head">
           <div class="segmented compact">
             <button :class="{ active: tab === 'group' }" @click="switchTab('group')">
-              群组 {{ groupIds.length }}
+              会话 {{ groupIds.length }}
             </button>
             <button :class="{ active: tab === 'person' }" @click="switchTab('person')">
-              联系人 {{ personIds.length }}
+              人物 {{ personIds.length }}
             </button>
           </div>
           <input
             v-model="query"
             class="search-input scope-search"
-            :placeholder="tab === 'group' ? '搜索群名' : '搜索联系人'"
+            :placeholder="tab === 'group' ? '搜索会话' : '搜索人物'"
           />
         </div>
 
@@ -157,15 +157,15 @@ onMounted(async () => {
         <div class="hint">
           {{
             configured
-              ? "群组只控制群列表，联系人只控制「按人」列表。"
-              : "保存后，群组只控制群列表，联系人只控制「按人」列表；新出现的群和联系人需要回来勾选。"
+              ? "会话控制左侧会话列表，人物控制「关注」里能看到的人。"
+              : "保存后，会话控制左侧会话列表，人物控制「关注」里能看到的人；新出现的会话和人物需要回来勾选。"
           }}
         </div>
       </div>
 
       <div class="modal-foot scope-foot">
         <div class="scope-summary">
-          已选 {{ groupIds.length }} 个群组 · {{ personIds.length }} 位联系人
+          已选 {{ groupIds.length }} 个会话 · {{ personIds.length }} 位人物
         </div>
         <div class="scope-actions">
           <button class="text-btn" @click="selectAll">全选</button>

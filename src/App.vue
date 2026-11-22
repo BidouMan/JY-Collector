@@ -15,10 +15,6 @@ const view = ref<View>("collect");
 <template>
   <div class="app">
     <header class="appbar">
-      <div class="brand">
-        <span class="brand-mark">JY</span>
-        <span class="brand-title">群录</span>
-      </div>
       <nav class="appnav">
         <button :class="{ active: view === 'collect' }" @click="view = 'collect'">
           采集
@@ -26,16 +22,20 @@ const view = ref<View>("collect");
         <button :class="{ active: view === 'search' }" @click="view = 'search'">
           查找
         </button>
-        <button :class="{ active: view === 'records' }" @click="view = 'records'">
-          记录表
-        </button>
         <button :class="{ active: view === 'ledger' }" @click="view = 'ledger'">
-          台账
+          数据
+        </button>
+        <button :class="{ active: view === 'records' }" @click="view = 'records'">
+          记录
         </button>
         <button :class="{ active: view === 'settings' }" @click="view = 'settings'">
           设置
         </button>
       </nav>
+      <div class="brand">
+        <span class="brand-title">JY Collector</span>
+        <img class="brand-mark" src="/app-icon.png" alt="JY" />
+      </div>
     </header>
 
     <main class="app-main">

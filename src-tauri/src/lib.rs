@@ -2,14 +2,16 @@ mod db;
 mod export;
 mod extract;
 mod ledger;
+mod media;
 mod models;
 mod wechat;
 
 use models::{
-    AppendReportDto, AvatarDto, BootstrapDto, CaptureScopeDto, GroupDto, MessageDto, PersonDto,
-    RecordDto, RecordPayload, RecordSourceDto, SchemaDto, SchemaInput, SearchPageDto, SearchQuery,
-    SettingsDto, SheetInfoDto, SheetRowDto, SheetTableDto, SourceStatusDto, SyncSummaryDto,
-    TemplateDto, TemplateInput,
+    AppendReportDto, AvatarDto, AvatarUrlDto, BootstrapDto, CaptureScopeDto, GroupDto,
+    ImagePayloadDto,
+    MessageDto, PersonDto, RecordDto, RecordPayload, RecordSourceDto, SchemaDto, SchemaInput,
+    SearchPageDto, SearchQuery, SettingsDto, SheetColumnInput, SheetInfoDto, SheetRowDto,
+    SheetTableDto, SourceStatusDto, SyncSummaryDto, TemplateColumn, TemplateDto, TemplateInput,
 };
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -109,11 +111,63 @@ fn sync_avatars(
     source: State<wechat::SourceState>,
 ) -> Result<usize, String> {
     let account = source.status.lock().map_err(db_err)?.account.clone();
-    let avatars = wechat::avatar_snapshot(&source.sidecar_dir, &account)?;
-    let count = avatars.len();
+    let snapshot = wechat::avatar_snapshot(&source.sidecar_dir, &account)?;
+    let count = snapshot.avatars.len();
     let mut conn = db.0.lock().map_err(db_err)?;
-    db::apply_avatars(&mut conn, &avatars).map_err(db_err)?;
+    db::apply_avatars(&mut conn, &snapshot.avatars, &snapshot.urls).map_err(db_err)?;
     Ok(count)
+}
+
+#[tauri::command]
+fn list_avatar_urls(db: State<DbState>) -> Result<Vec<AvatarUrlDto>, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    db::list_avatar_urls(&conn).map_err(db_err)
+}
+
+/// 按需下载联系人头像（群成员也能覆盖到），不落盘。
+#[tauri::command]
+async fn load_avatar(
+    entity_id: String,
+    db: State<'_, DbState>,
+) -> Result<ImagePayloadDto, String> {
+    let url = {
+        let conn = db.0.lock().map_err(db_err)?;
+        db::avatar_url(&conn, &entity_id).map_err(db_err)?
+    };
+    let url = url.ok_or_else(|| "没有可用的头像地址".to_string())?;
+    let (mime, data) = media::load_avatar(&url).await?;
+    Ok(ImagePayloadDto { mime, data })
+}
+
+/// 按需下载并解密一条表情消息（不落盘）。
+#[tauri::command]
+async fn load_message_emoticon(
+    message_id: String,
+    db: State<'_, DbState>,
+) -> Result<ImagePayloadDto, String> {
+    let (_, url, key) = {
+        let conn = db.0.lock().map_err(db_err)?;
+        db::message_emoticon(&conn, &message_id)
+            .map_err(db_err)?
+            .ok_or_else(|| "这条表情没有可用的下载地址".to_string())?
+    };
+    let (mime, data) = media::load_emoticon(&url, key.as_deref()).await?;
+    Ok(ImagePayloadDto { mime, data })
+}
+
+/// 按需解密一条图片消息。full=false 取缩略图，true 取原图。
+#[tauri::command]
+fn load_message_image(
+    md5_hex: String,
+    full: bool,
+    source: State<wechat::SourceState>,
+) -> Result<ImagePayloadDto, String> {
+    let account = source.status.lock().map_err(db_err)?.account.clone();
+    if account.is_empty() {
+        return Err("尚未同步微信数据".to_string());
+    }
+    let (mime, data) = media::load_image(&account, &md5_hex, full)?;
+    Ok(ImagePayloadDto { mime, data })
 }
 
 #[tauri::command]
@@ -130,6 +184,23 @@ fn search_people(
 fn get_message(message_id: String, db: State<DbState>) -> Result<Option<MessageDto>, String> {
     let conn = db.0.lock().map_err(db_err)?;
     db::get_message(&conn, &message_id).map_err(db_err)
+}
+
+#[tauri::command]
+fn list_followed(keyword: String, db: State<DbState>) -> Result<Vec<PersonDto>, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    db::list_followed_people(&conn, &keyword).map_err(db_err)
+}
+
+#[tauri::command]
+fn toggle_follow(
+    sender_id: String,
+    sender_name: String,
+    followed: bool,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    db::set_followed(&conn, &sender_id, &sender_name, followed).map_err(db_err)
 }
 
 #[tauri::command]
@@ -367,6 +438,66 @@ fn column_cell_value(template: &TemplateDto, index: usize, text: &str) -> ledger
     ledger::CellValue::Text(text.to_string())
 }
 
+/// 表格列可能比配置多（例如手动导入的表格），先补齐配置列，保证按列号同步时不会错位。
+fn pad_template_columns(columns: &mut Vec<TemplateColumn>, headers: &[String]) {
+    for (index, label) in headers.iter().enumerate() {
+        if index >= columns.len() {
+            let key = next_column_key(columns, index);
+            columns.push(TemplateColumn {
+                key,
+                label: label.clone(),
+                width: 18,
+                format: "text".to_string(),
+                hint: String::new(),
+            });
+        }
+    }
+}
+
+fn next_column_key(columns: &[TemplateColumn], start: usize) -> String {
+    let mut counter = start + 1;
+    loop {
+        let key = format!("col_{}", counter);
+        if !columns.iter().any(|column| column.key == key) {
+            return key;
+        }
+        counter += 1;
+    }
+}
+
+fn next_column_key_from(
+    used: &std::collections::HashSet<String>,
+    start: usize,
+) -> String {
+    let mut counter = start + 1;
+    loop {
+        let key = format!("col_{}", counter);
+        if !used.contains(&key) {
+            return key;
+        }
+        counter += 1;
+    }
+}
+
+fn save_template_columns(
+    conn: &mut rusqlite::Connection,
+    template: &TemplateDto,
+    columns: Vec<TemplateColumn>,
+) -> Result<(), String> {
+    let input = TemplateInput {
+        id: Some(template.id.clone()),
+        name: template.name.clone(),
+        columns,
+        target_path: template.target_path.clone(),
+        sheet_name: template.sheet_name.clone(),
+        header_row: template.header_row,
+        file_name_rule: template.file_name_rule.clone(),
+        is_default: template.is_default,
+    };
+    db::save_template(conn, &input).map_err(db_err)?;
+    Ok(())
+}
+
 /// 读取最终 Excel 表格的完整内容；文件还没生成时按模板列返回空表。
 #[tauri::command]
 fn read_sheet_data(template_id: String, db: State<DbState>) -> Result<SheetTableDto, String> {
@@ -395,6 +526,70 @@ fn read_sheet_data(template_id: String, db: State<DbState>) -> Result<SheetTable
     }
 
     let table = ledger::read_sheet_table(&path, &template.sheet_name, header_row)?;
+    Ok(SheetTableDto {
+        path: path.to_string_lossy().to_string(),
+        sheet: table.name,
+        header_row,
+        headers: table.headers,
+        rows: table
+            .rows
+            .into_iter()
+            .map(|row| SheetRowDto {
+                row: row.index,
+                cells: row.cells,
+            })
+            .collect(),
+    })
+}
+
+/// 列出模板工作簿里的全部工作表；文件还没生成时返回空列表。
+#[tauri::command]
+fn read_template_sheets(
+    template_id: String,
+    db: State<DbState>,
+) -> Result<Vec<SheetInfoDto>, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let Some(path) = resolve_export_path(&template) else {
+        return Ok(Vec::new());
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let sheets = ledger::read_workbook(&path)?;
+    Ok(sheets
+        .into_iter()
+        .map(|sheet| SheetInfoDto {
+            name: sheet.name,
+            headers: sheet.headers,
+            rows: sheet.rows,
+        })
+        .collect())
+}
+
+/// 按名称读取模板工作簿里的任意工作表，用于名录页按 sheet 浏览。
+#[tauri::command]
+fn read_sheet_data_named(
+    template_id: String,
+    sheet_name: String,
+    db: State<DbState>,
+) -> Result<SheetTableDto, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let header_row = template.header_row.max(1) as u32;
+
+    if !path.exists() {
+        return Ok(SheetTableDto {
+            path: path.to_string_lossy().to_string(),
+            sheet: sheet_name,
+            header_row,
+            headers: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
+
+    let table = ledger::read_sheet_table(&path, &sheet_name, header_row)?;
     Ok(SheetTableDto {
         path: path.to_string_lossy().to_string(),
         sheet: table.name,
@@ -443,6 +638,23 @@ fn delete_sheet_row(template_id: String, row: u32, db: State<DbState>) -> Result
 }
 
 #[tauri::command]
+fn reorder_sheet_rows(
+    template_id: String,
+    rows: Vec<u32>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    ledger::reorder_rows(
+        &path,
+        &template.sheet_name,
+        template.header_row.max(1) as u32,
+        &rows,
+    )
+}
+
+#[tauri::command]
 fn append_sheet_row(
     template_id: String,
     values: Vec<String>,
@@ -479,6 +691,251 @@ fn append_sheet_row(
         template.header_row.max(1) as u32,
         &cells,
     )
+}
+
+/// 修改表头文字，同时更新导出配置里的列名，保证后续追加还能匹配到这一列。
+#[tauri::command]
+fn rename_sheet_column(
+    template_id: String,
+    column: u32,
+    label: String,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("列名不能为空".to_string());
+    }
+    if column == 0 {
+        return Err("列号无效".to_string());
+    }
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let index = (column - 1) as usize;
+    let header_row = template.header_row.max(1) as u32;
+
+    if !path.exists() {
+        let mut columns = template.columns.clone();
+        let Some(target) = columns.get_mut(index) else {
+            return Err("列不存在，请先完成一次追加导出".to_string());
+        };
+        target.label = label;
+        return save_template_columns(&mut conn, &template, columns);
+    }
+
+    let table = ledger::read_sheet_table(&path, &template.sheet_name, header_row)?;
+    if index >= table.headers.len() {
+        return Err("列不存在，请刷新后重试".to_string());
+    }
+    if table
+        .headers
+        .iter()
+        .enumerate()
+        .any(|(position, header)| position != index && header == &label)
+    {
+        return Err("列名不能重复".to_string());
+    }
+
+    let mut values: Vec<Option<ledger::CellValue>> = vec![None; index + 1];
+    values[index] = Some(ledger::CellValue::Text(label.clone()));
+    ledger::update_row(&path, &template.sheet_name, header_row, &values)?;
+
+    let mut columns = template.columns.clone();
+    pad_template_columns(&mut columns, &table.headers);
+    if let Some(target) = columns.get_mut(index) {
+        target.label = label;
+    }
+    save_template_columns(&mut conn, &template, columns)
+}
+
+/// 在表格末尾增加一列，并同步到导出配置。
+#[tauri::command]
+fn add_sheet_column(
+    template_id: String,
+    label: String,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err("列名不能为空".to_string());
+    }
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let header_row = template.header_row.max(1) as u32;
+
+    if !path.exists() {
+        let mut columns = template.columns.clone();
+        if columns.iter().any(|column| column.label == label) {
+            return Err("列名不能重复".to_string());
+        }
+        let mut headers: Vec<String> = columns
+            .iter()
+            .map(|column| column.label.clone())
+            .collect();
+        headers.push(label.clone());
+        ledger::sync_headers(&path, &template.sheet_name, 1, &headers)?;
+        let key = next_column_key(&columns, columns.len());
+        columns.push(TemplateColumn {
+            key,
+            label,
+            width: 18,
+            format: "text".to_string(),
+            hint: String::new(),
+        });
+        return save_template_columns(&mut conn, &template, columns);
+    }
+
+    let table = ledger::read_sheet_table(&path, &template.sheet_name, header_row)?;
+    if table.headers.iter().any(|header| header == &label) {
+        return Err("列名不能重复".to_string());
+    }
+    let next_col = table.headers.len() as u32 + 1;
+    let mut values: Vec<Option<ledger::CellValue>> = vec![None; next_col as usize];
+    values[(next_col - 1) as usize] = Some(ledger::CellValue::Text(label.clone()));
+    ledger::update_row(&path, &template.sheet_name, header_row, &values)?;
+
+    let mut columns = template.columns.clone();
+    pad_template_columns(&mut columns, &table.headers);
+    let key = next_column_key(&columns, table.headers.len());
+    columns.insert(
+        table.headers.len(),
+        TemplateColumn {
+            key,
+            label,
+            width: 18,
+            format: "text".to_string(),
+            hint: String::new(),
+        },
+    );
+    save_template_columns(&mut conn, &template, columns)
+}
+
+/// 删除一列（连同这一列的数据），并同步到导出配置。
+#[tauri::command]
+fn remove_sheet_column(
+    template_id: String,
+    column: u32,
+    db: State<DbState>,
+) -> Result<(), String> {
+    if column == 0 {
+        return Err("列号无效".to_string());
+    }
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let index = (column - 1) as usize;
+    let header_row = template.header_row.max(1) as u32;
+
+    if !path.exists() {
+        let mut columns = template.columns.clone();
+        if columns.len() <= 1 {
+            return Err("至少保留一列".to_string());
+        }
+        if index >= columns.len() {
+            return Err("列不存在".to_string());
+        }
+        columns.remove(index);
+        return save_template_columns(&mut conn, &template, columns);
+    }
+
+    let table = ledger::read_sheet_table(&path, &template.sheet_name, header_row)?;
+    if table.headers.len() <= 1 {
+        return Err("至少保留一列".to_string());
+    }
+    if index >= table.headers.len() {
+        return Err("列不存在，请刷新后重试".to_string());
+    }
+    ledger::remove_column(&path, &template.sheet_name, column)?;
+
+    let mut columns = template.columns.clone();
+    pad_template_columns(&mut columns, &table.headers);
+    if index < columns.len() {
+        columns.remove(index);
+    }
+    save_template_columns(&mut conn, &template, columns)
+}
+
+/// 一次性保存列设置：列名、示例、宽度、格式，以及列的增删和顺序。
+#[tauri::command]
+fn save_sheet_columns(
+    template_id: String,
+    columns: Vec<SheetColumnInput>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    if columns.is_empty() {
+        return Err("至少保留一列".to_string());
+    }
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let header_row = template.header_row.max(1) as u32;
+
+    let mut labels = std::collections::HashSet::new();
+    let mut sources = std::collections::HashSet::new();
+    for column in &columns {
+        let label = column.label.trim();
+        if label.is_empty() {
+            return Err("列名不能为空".to_string());
+        }
+        if !labels.insert(label.to_string()) {
+            return Err("列名不能重复".to_string());
+        }
+        if column.source > 0 && !sources.insert(column.source) {
+            return Err("列设置有重复，请刷新后重试".to_string());
+        }
+    }
+
+    if !path.exists() {
+        let headers: Vec<String> = columns
+            .iter()
+            .map(|column| column.label.trim().to_string())
+            .collect();
+        ledger::sync_headers(&path, &template.sheet_name, 1, &headers)?;
+    } else {
+        let specs: Vec<ledger::ColumnSpec> = columns
+            .iter()
+            .map(|column| ledger::ColumnSpec {
+                source: column.source,
+                label: column.label.trim().to_string(),
+                width: column.width,
+            })
+            .collect();
+        ledger::save_columns(&path, &template.sheet_name, header_row, &specs)?;
+    }
+
+    let mut used: std::collections::HashSet<String> = template
+        .columns
+        .iter()
+        .map(|column| column.key.clone())
+        .collect();
+    let mut next_columns: Vec<TemplateColumn> = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let key = if column.source > 0 {
+            template
+                .columns
+                .get((column.source - 1) as usize)
+                .map(|item| item.key.clone())
+                .filter(|key| !key.is_empty())
+                .unwrap_or_else(|| next_column_key_from(&used, index))
+        } else {
+            next_column_key_from(&used, index)
+        };
+        used.insert(key.clone());
+        let format = match column.format.as_str() {
+            "number" => "number",
+            "date" => "date",
+            _ => "text",
+        };
+        next_columns.push(TemplateColumn {
+            key,
+            label: column.label.trim().to_string(),
+            width: column.width.clamp(6, 80),
+            format: format.to_string(),
+            hint: column.hint.trim().to_string(),
+        });
+    }
+    save_template_columns(&mut conn, &template, next_columns)
 }
 
 #[tauri::command]
@@ -783,7 +1240,7 @@ pub fn run() {
             app.manage(DataDirState(data_dir));
             app.manage(source);
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_title("群录");
+                let _ = window.set_title("");
             }
             Ok(())
         })
@@ -793,8 +1250,14 @@ pub fn run() {
             list_messages,
             list_person_messages,
             list_avatars,
+            list_avatar_urls,
             sync_avatars,
+            load_avatar,
+            load_message_image,
+            load_message_emoticon,
             search_people,
+            list_followed,
+            toggle_follow,
             get_message,
             search_messages,
             message_context,
@@ -814,10 +1277,17 @@ pub fn run() {
             list_templates,
             list_workbooks,
             read_workbook,
+            read_template_sheets,
             read_sheet_data,
+            read_sheet_data_named,
             update_sheet_row,
             delete_sheet_row,
+            reorder_sheet_rows,
             append_sheet_row,
+            rename_sheet_column,
+            add_sheet_column,
+            remove_sheet_column,
+            save_sheet_columns,
             save_template,
             delete_template,
             set_default_template,

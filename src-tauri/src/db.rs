@@ -1,7 +1,8 @@
 use crate::models::{
-    AvatarDto, GroupDto, MessageDto, PersonDto, RecordDto, RecordPayload, RecordSourceDto,
-    SchemaDto, SchemaInput, SearchItemDto, SearchPageDto, SearchQuery, SettingsDto, TemplateColumn,
-    TemplateDto, TemplateInput, WxAvatarInput, WxGroupInput, WxMessageInput,
+    AvatarDto, AvatarUrlDto, GroupDto, MessageDto, PersonDto, RecordDto, RecordPayload,
+    RecordSourceDto, SchemaDto, SchemaInput, SearchItemDto, SearchPageDto, SearchQuery,
+    SettingsDto, TemplateColumn, TemplateDto, TemplateInput, WxAvatarInput, WxAvatarUrlInput,
+    WxGroupInput, WxMessageInput,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -15,7 +16,8 @@ CREATE TABLE IF NOT EXISTS chat_groups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     member_count INTEGER NOT NULL DEFAULT 0,
-    last_active TEXT
+    last_active TEXT,
+    kind TEXT NOT NULL DEFAULT 'group'
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -30,6 +32,10 @@ CREATE TABLE IF NOT EXISTS messages (
     quoted_sender TEXT,
     file_name TEXT,
     file_size TEXT,
+    image_md5 TEXT,
+    emoticon_md5 TEXT,
+    emoticon_url TEXT,
+    emoticon_key TEXT,
     created_at TEXT NOT NULL,
     source_ts INTEGER
 );
@@ -66,6 +72,12 @@ CREATE TABLE IF NOT EXISTS templates (
 CREATE TABLE IF NOT EXISTS basket (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     added_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS followed_people (
+    sender_id TEXT PRIMARY KEY,
+    sender_name TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS record_sources (
@@ -105,6 +117,12 @@ CREATE TABLE IF NOT EXISTS avatars (
     entity_id TEXT PRIMARY KEY,
     mime TEXT NOT NULL,
     data_b64 TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS avatar_urls (
+    entity_id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 "#;
@@ -412,7 +430,8 @@ pub fn mark_exported(
 const MESSAGE_SELECT: &str = r#"
 SELECT m.id, m.group_id, g.name, m.sender_id, m.sender_name, m.message_type, m.content,
        m.quoted_message_id, COALESCE(q.content, m.quoted_content),
-       COALESCE(q.sender_name, m.quoted_sender), m.file_name, m.file_size, m.created_at
+       COALESCE(q.sender_name, m.quoted_sender), m.file_name, m.file_size, m.created_at,
+       m.image_md5, m.emoticon_md5, m.emoticon_url, m.emoticon_key
 FROM messages m
 JOIN chat_groups g ON g.id = m.group_id
 LEFT JOIN messages q ON q.id = m.quoted_message_id
@@ -430,14 +449,106 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
 /// 旧版本数据库补列（SQLite 的 ADD COLUMN 是 O(1)，不会重写整库）。
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "chat_groups", "last_active", "TEXT")?;
+    ensure_column(conn, "chat_groups", "kind", "TEXT NOT NULL DEFAULT 'group'")?;
     ensure_column(conn, "messages", "quoted_content", "TEXT")?;
     ensure_column(conn, "messages", "quoted_sender", "TEXT")?;
     ensure_column(conn, "messages", "source_ts", "INTEGER")?;
+    ensure_column(conn, "messages", "image_md5", "TEXT")?;
+    ensure_column(conn, "messages", "emoticon_md5", "TEXT")?;
+    ensure_column(conn, "messages", "emoticon_url", "TEXT")?;
+    ensure_column(conn, "messages", "emoticon_key", "TEXT")?;
     ensure_column(conn, "records", "template_id", "TEXT")?;
     ensure_column(conn, "records", "exported_at", "TEXT")?;
     ensure_column(conn, "records", "export_batch", "TEXT")?;
     ensure_column(conn, "records", "export_target", "TEXT")?;
+    // 检索索引属于可选能力：建不出来就保持 LIKE 检索，不阻塞启动。
+    if ensure_search_index(conn).is_err() {
+        let _ = conn.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_fts_ai;
+             DROP TRIGGER IF EXISTS messages_fts_ad;
+             DROP TRIGGER IF EXISTS messages_fts_au;
+             DROP TABLE IF EXISTS messages_fts;",
+        );
+    }
     Ok(())
+}
+
+/// 全文检索索引：FTS5 trigram 支持中文/英文的任意子串匹配，和原来的
+/// `LIKE '%关键词%'` 语义一致，但不需要全表扫描；关键词少于 3 个字符时
+/// 仍回退 LIKE（trigram 无法索引 1~2 个字符）。
+fn ensure_search_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content, quoted_content, file_name,
+    content='messages', content_rowid='rowid', tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content, quoted_content, file_name)
+    VALUES (new.rowid, new.content, COALESCE(new.quoted_content, ''), COALESCE(new.file_name, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, quoted_content, file_name)
+    VALUES ('delete', old.rowid, old.content, COALESCE(old.quoted_content, ''), COALESCE(old.file_name, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages
+WHEN old.content IS NOT new.content
+  OR old.quoted_content IS NOT new.quoted_content
+  OR old.file_name IS NOT new.file_name
+BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, quoted_content, file_name)
+    VALUES ('delete', old.rowid, old.content, COALESCE(old.quoted_content, ''), COALESCE(old.file_name, ''));
+    INSERT INTO messages_fts(rowid, content, quoted_content, file_name)
+    VALUES (new.rowid, new.content, COALESCE(new.quoted_content, ''), COALESCE(new.file_name, ''));
+END;
+"#,
+    )?;
+    // 外部内容表的 COUNT(*) 查的是 messages 而不是索引本身，不能用来判断
+    // 索引是否已建好；用版本标记保证首次升级时完整重建一次。
+    const FTS_VERSION: &str = "1";
+    let built: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'search_fts_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if built.as_deref() != Some(FTS_VERSION) {
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')", [])?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('search_fts_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![FTS_VERSION],
+        )?;
+    }
+    Ok(())
+}
+
+/// 只有索引表和三个同步触发器都齐全时才走 FTS，避免索引失效后搜不到数据。
+fn search_index_ready(conn: &Connection) -> bool {
+    let table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if table == 0 {
+        return false;
+    }
+    let triggers: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'trigger'
+               AND name IN ('messages_fts_ai', 'messages_fts_ad', 'messages_fts_au')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    triggers == 3
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> rusqlite::Result<()> {
@@ -502,6 +613,10 @@ fn message_from_row(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<Mess
         file_name: row.get(offset + 10)?,
         file_size: row.get(offset + 11)?,
         created_at: row.get(offset + 12)?,
+        image_md5: row.get(offset + 13)?,
+        emoticon_md5: row.get(offset + 14)?,
+        emoticon_url: row.get(offset + 15)?,
+        emoticon_key: row.get(offset + 16)?,
     })
 }
 
@@ -589,7 +704,8 @@ fn list_groups_where(conn: &Connection, filter: &str) -> rusqlite::Result<Vec<Gr
                (SELECT COUNT(*) FROM messages m WHERE m.group_id = g.id),
                (SELECT COUNT(*) FROM records r WHERE r.group_id = g.id),
                COALESCE(NULLIF(g.last_active, ''),
-                        (SELECT MAX(m.created_at) FROM messages m WHERE m.group_id = g.id))
+                        (SELECT MAX(m.created_at) FROM messages m WHERE m.group_id = g.id)),
+               g.kind
         FROM chat_groups g
         {}
         ORDER BY 6 DESC, g.name ASC
@@ -605,6 +721,7 @@ fn list_groups_where(conn: &Connection, filter: &str) -> rusqlite::Result<Vec<Gr
             message_count: row.get(3)?,
             record_count: row.get(4)?,
             last_at: row.get(5)?,
+            kind: row.get(6)?,
         })
     })?;
     rows.collect()
@@ -645,23 +762,26 @@ pub fn apply_wechat_sync(
     groups: &[WxGroupInput],
     messages: &[WxMessageInput],
     avatars: &[WxAvatarInput],
+    avatar_urls: &[WxAvatarUrlInput],
 ) -> rusqlite::Result<(i64, i64)> {
     let before: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
     let tx = conn.transaction()?;
 
     for group in groups {
         tx.execute(
-            "INSERT INTO chat_groups (id, name, member_count, last_active)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO chat_groups (id, name, member_count, last_active, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 member_count = excluded.member_count,
-                last_active = excluded.last_active",
+                last_active = excluded.last_active,
+                kind = excluded.kind",
             params![
                 group.id,
                 group.name,
                 group.member_count,
-                epoch_to_local(group.last_active.unwrap_or(0))
+                epoch_to_local(group.last_active.unwrap_or(0)),
+                if group.kind.is_empty() { "group" } else { group.kind.as_str() }
             ],
         )?;
         for (index, (key, label, field_type, required, example)) in
@@ -692,8 +812,9 @@ pub fn apply_wechat_sync(
             "INSERT INTO messages
                 (id, group_id, sender_id, sender_name, message_type, content,
                  quoted_message_id, quoted_content, quoted_sender,
-                 file_name, file_size, created_at, source_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12)
+                 file_name, file_size, image_md5, emoticon_md5, emoticon_url, emoticon_key,
+                 created_at, source_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                 sender_id = excluded.sender_id,
                 sender_name = excluded.sender_name,
@@ -703,6 +824,10 @@ pub fn apply_wechat_sync(
                 quoted_sender = excluded.quoted_sender,
                 file_name = excluded.file_name,
                 file_size = excluded.file_size,
+                image_md5 = excluded.image_md5,
+                emoticon_md5 = excluded.emoticon_md5,
+                emoticon_url = excluded.emoticon_url,
+                emoticon_key = excluded.emoticon_key,
                 created_at = excluded.created_at,
                 source_ts = excluded.source_ts",
             params![
@@ -716,6 +841,10 @@ pub fn apply_wechat_sync(
                 message.quoted_sender,
                 message.file_name,
                 message.file_size,
+                message.image_md5,
+                message.emoticon_md5,
+                message.emoticon_url,
+                message.emoticon_key,
                 epoch_to_local(message.created_at).unwrap_or_else(|| "1970-01-01 00:00:00".into()),
                 message.created_at
             ],
@@ -723,6 +852,7 @@ pub fn apply_wechat_sync(
     }
 
     upsert_avatars(&tx, avatars)?;
+    upsert_avatar_urls(&tx, avatar_urls)?;
 
     tx.commit()?;
     let after: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
@@ -749,10 +879,36 @@ fn upsert_avatars(conn: &Connection, avatars: &[WxAvatarInput]) -> rusqlite::Res
 }
 
 /// 单独写入头像（不触发消息同步）。
-pub fn apply_avatars(conn: &mut Connection, avatars: &[WxAvatarInput]) -> rusqlite::Result<()> {
+pub fn apply_avatars(
+    conn: &mut Connection,
+    avatars: &[WxAvatarInput],
+    avatar_urls: &[WxAvatarUrlInput],
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     upsert_avatars(&tx, avatars)?;
+    upsert_avatar_urls(&tx, avatar_urls)?;
     tx.commit()
+}
+
+fn upsert_avatar_urls(
+    conn: &Connection,
+    urls: &[WxAvatarUrlInput],
+) -> rusqlite::Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    for entry in urls {
+        if entry.entity_id.is_empty() || !entry.url.starts_with("https://") {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO avatar_urls (entity_id, url, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(entity_id) DO UPDATE SET
+                url = excluded.url,
+                updated_at = excluded.updated_at",
+            params![entry.entity_id, entry.url, now],
+        )?;
+    }
+    Ok(())
 }
 
 /// 读取全部头像（entityId 为 wxid 或群 username）。
@@ -766,6 +922,27 @@ pub fn list_avatars(conn: &Connection) -> rusqlite::Result<Vec<AvatarDto>> {
         })
     })?;
     rows.collect()
+}
+
+/// 读取全部头像 CDN 地址，供前端按需下载。
+pub fn list_avatar_urls(conn: &Connection) -> rusqlite::Result<Vec<AvatarUrlDto>> {
+    let mut stmt = conn.prepare("SELECT entity_id, url FROM avatar_urls")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(AvatarUrlDto {
+            entity_id: row.get(0)?,
+            url: row.get(1)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn avatar_url(conn: &Connection, entity_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT url FROM avatar_urls WHERE entity_id = ?1",
+        params![entity_id],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 pub fn list_messages(conn: &Connection, group_id: &str) -> rusqlite::Result<Vec<MessageDto>> {
@@ -802,6 +979,27 @@ pub fn get_message(conn: &Connection, message_id: &str) -> rusqlite::Result<Opti
     }
 }
 
+/// 读取表情消息的下载地址与密钥（md5、url、aeskey）。
+pub fn message_emoticon(
+    conn: &Connection,
+    message_id: &str,
+) -> rusqlite::Result<Option<(String, String, Option<String>)>> {
+    conn.query_row(
+        "SELECT COALESCE(emoticon_md5, ''), COALESCE(emoticon_url, ''), emoticon_key
+         FROM messages WHERE id = ?1",
+        params![message_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )
+    .optional()
+    .map(|row| row.filter(|(_, url, _)| !url.is_empty()))
+}
+
 pub fn search_people(
     conn: &Connection,
     keyword: &str,
@@ -819,7 +1017,8 @@ pub fn search_people(
         SELECT m.sender_id, m.sender_name, COUNT(*) AS message_count,
                COUNT(DISTINCT m.group_id) AS group_count,
                GROUP_CONCAT(DISTINCT g.name) AS group_names,
-               MAX(m.created_at) AS last_at
+               MAX(m.created_at) AS last_at,
+               EXISTS(SELECT 1 FROM followed_people f WHERE f.sender_id = m.sender_id)
         FROM messages m
         JOIN chat_groups g ON g.id = m.group_id
         WHERE (m.sender_name LIKE ?1 OR m.sender_id LIKE ?1){}
@@ -839,9 +1038,74 @@ pub fn search_people(
             group_count: row.get(3)?,
             group_names: group_names.replace(',', "、"),
             last_at: row.get(5)?,
+            is_followed: row.get(6)?,
         })
     })?;
     rows.collect()
+}
+
+/// 关注列表：只返回被关注的人；还没有消息的人也会保留。
+pub fn list_followed_people(conn: &Connection, keyword: &str) -> rusqlite::Result<Vec<PersonDto>> {
+    let scope = if scope_configured(conn)? {
+        format!(" AND {}", SCOPE_MESSAGE_FILTER)
+    } else {
+        String::new()
+    };
+    let sql = format!(
+        r#"
+        SELECT f.sender_id, f.sender_name,
+               COUNT(m.id) AS message_count,
+               COUNT(DISTINCT m.group_id) AS group_count,
+               COALESCE(GROUP_CONCAT(DISTINCT g.name), '') AS group_names,
+               MAX(m.created_at) AS last_at
+        FROM followed_people f
+        LEFT JOIN messages m ON m.sender_id = f.sender_id{}
+        LEFT JOIN chat_groups g ON g.id = m.group_id
+        WHERE (f.sender_name LIKE ?1 OR f.sender_id LIKE ?1)
+        GROUP BY f.sender_id, f.sender_name
+        ORDER BY 6 DESC, f.sender_name ASC
+    "#,
+        scope
+    );
+    let pattern = format!("%{}%", keyword);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![pattern], |row| {
+        let group_names: String = row.get(4)?;
+        Ok(PersonDto {
+            sender_id: row.get(0)?,
+            sender_name: row.get(1)?,
+            message_count: row.get(2)?,
+            group_count: row.get(3)?,
+            group_names: group_names.replace(',', "、"),
+            last_at: row.get(5)?,
+            is_followed: true,
+        })
+    })?;
+    rows.collect()
+}
+
+/// 关注或取消关注一个人。
+pub fn set_followed(
+    conn: &Connection,
+    sender_id: &str,
+    sender_name: &str,
+    followed: bool,
+) -> rusqlite::Result<()> {
+    if followed {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        conn.execute(
+            "INSERT INTO followed_people (sender_id, sender_name, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(sender_id) DO UPDATE SET sender_name = excluded.sender_name",
+            params![sender_id, sender_name, now],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM followed_people WHERE sender_id = ?1",
+            params![sender_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn like_escape(raw: &str) -> String {
@@ -859,8 +1123,22 @@ fn like_contains(raw: &str) -> String {
     format!("%{}%", like_escape(raw))
 }
 
+/// trigram 索引至少要 3 个字符才能命中，更短的词继续用 LIKE。
+fn can_use_fts(term: &str, ready: bool) -> bool {
+    ready && term.chars().count() >= 3
+}
+
+/// FTS5 短语查询：整体加引号按字面子串匹配，内部双引号用两个双引号转义。
+fn fts_phrase(raw: &str) -> String {
+    format!("\"{}\"", raw.replace('"', "\"\""))
+}
+
 /// 组装检索的 WHERE 子句与绑定值，供列表与总数共用。
-fn search_where(query: &SearchQuery, scope_filter: Option<&str>) -> (String, Vec<Value>) {
+fn search_where(
+    query: &SearchQuery,
+    scope_filter: Option<&str>,
+    fts_ready: bool,
+) -> (String, Vec<Value>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
 
@@ -877,6 +1155,11 @@ fn search_where(query: &SearchQuery, scope_filter: Option<&str>) -> (String, Vec
             );
             values.push(Value::Text(keyword.to_string()));
             values.push(Value::Text(keyword.to_string()));
+        } else if can_use_fts(keyword, fts_ready) {
+            clauses.push(
+                "m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)".into(),
+            );
+            values.push(Value::Text(fts_phrase(keyword)));
         } else {
             clauses.push(
                 "(m.content LIKE ? ESCAPE '\\' OR COALESCE(m.quoted_content, '') LIKE ? ESCAPE '\\' OR COALESCE(m.file_name, '') LIKE ? ESCAPE '\\')"
@@ -914,8 +1197,16 @@ fn search_where(query: &SearchQuery, scope_filter: Option<&str>) -> (String, Vec
 
     let mention = query.mention.trim().trim_start_matches('@').trim();
     if !mention.is_empty() {
-        clauses.push("m.content LIKE ? ESCAPE '\\'".into());
-        values.push(Value::Text(format!("%@{}%", like_escape(mention))));
+        let term = format!("@{}", mention);
+        if can_use_fts(&term, fts_ready) {
+            clauses.push(
+                "m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)".into(),
+            );
+            values.push(Value::Text(fts_phrase(&term)));
+        } else {
+            clauses.push("m.content LIKE ? ESCAPE '\\'".into());
+            values.push(Value::Text(format!("%@{}%", like_escape(mention))));
+        }
     }
 
     let types: Vec<&String> = query
@@ -980,7 +1271,7 @@ pub fn search_messages(
     } else {
         None
     };
-    let (where_sql, mut values) = search_where(query, scope_filter);
+    let (where_sql, mut values) = search_where(query, scope_filter, search_index_ready(conn));
 
     let count_sql = format!("SELECT COUNT(*) FROM messages m WHERE {}", where_sql);
     let total: i64 =
@@ -993,6 +1284,8 @@ pub fn search_messages(
         "SELECT m.id, m.group_id, g.name, m.sender_id, m.sender_name, m.message_type, m.content,
                 m.quoted_message_id, COALESCE(q.content, m.quoted_content),
                 COALESCE(q.sender_name, m.quoted_sender), m.file_name, m.file_size, m.created_at,
+                m.image_md5,
+                m.emoticon_md5, m.emoticon_url, m.emoticon_key,
                 EXISTS (SELECT 1 FROM basket b WHERE b.message_id = m.id),
                 EXISTS (SELECT 1 FROM record_sources s WHERE s.message_id = m.id)
          FROM messages m
@@ -1010,8 +1303,8 @@ pub fn search_messages(
     let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
         Ok(SearchItemDto {
             message: message_from_row(row, 0)?,
-            in_basket: row.get::<_, i64>(13)? != 0,
-            in_record: row.get::<_, i64>(14)? != 0,
+            in_basket: row.get::<_, i64>(17)? != 0,
+            in_record: row.get::<_, i64>(18)? != 0,
         })
     })?;
     let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1323,6 +1616,10 @@ mod flow_tests {
             quoted_content: None,
             file_name: None,
             file_size: None,
+            image_md5: None,
+            emoticon_md5: None,
+            emoticon_url: None,
+            emoticon_key: None,
             created_at: ts,
         }
     }
@@ -1335,12 +1632,13 @@ mod flow_tests {
             name: "测试群".to_string(),
             member_count: 8,
             last_active: Some(1_700_000_100),
+            kind: "group".to_string(),
         }];
         let messages = vec![
             msg("123@chatroom", 1, 1_700_000_000, "张三", "周六下午两点上课，地址是浦江花园3号楼"),
             msg("123@chatroom", 2, 1_700_000_100, "李四", "收到"),
         ];
-        let (total, added) = apply_wechat_sync(&mut conn, &groups, &messages, &[]).unwrap();
+        let (total, added) = apply_wechat_sync(&mut conn, &groups, &messages, &[], &[]).unwrap();
         assert_eq!(total, 2);
         assert_eq!(added, 2);
 
@@ -1351,7 +1649,7 @@ mod flow_tests {
         assert_eq!(list_all_schemas(&conn).unwrap().len(), DEFAULT_SCHEMAS.len());
 
         // 重复同步不产生重复消息
-        let (total, added) = apply_wechat_sync(&mut conn, &groups, &messages, &[]).unwrap();
+        let (total, added) = apply_wechat_sync(&mut conn, &groups, &messages, &[], &[]).unwrap();
         assert_eq!(total, 2);
         assert_eq!(added, 0);
 
@@ -1445,12 +1743,14 @@ mod flow_tests {
                 name: "班级群A".to_string(),
                 member_count: 5,
                 last_active: Some(1_700_000_200),
+                kind: "group".to_string(),
             },
             WxGroupInput {
                 id: "g-b@chatroom".to_string(),
                 name: "班级群B".to_string(),
                 member_count: 5,
                 last_active: Some(1_700_100_000),
+                kind: "group".to_string(),
             },
         ];
         let messages = vec![
@@ -1459,7 +1759,7 @@ mod flow_tests {
             msg("g-a@chatroom", 3, 1_700_000_200, "张三", "收到"),
             msg("g-b@chatroom", 4, 1_700_100_000, "王五", "周六请假"),
         ];
-        apply_wechat_sync(&mut conn, &groups, &messages, &[]).unwrap();
+        apply_wechat_sync(&mut conn, &groups, &messages, &[], &[]).unwrap();
 
         let fuzzy = SearchQuery {
             keyword: "周六".to_string(),
@@ -1469,6 +1769,21 @@ mod flow_tests {
         let page = search_messages(&conn, &fuzzy).unwrap();
         assert_eq!(page.total, 2);
         assert_eq!(page.items.len(), 2);
+
+        // 3 个字符以上走 FTS 索引，1~2 个字符回退 LIKE，结果必须一致。
+        assert!(search_index_ready(&conn));
+        let fts_keyword = SearchQuery {
+            keyword: "周六上课".to_string(),
+            keyword_mode: "fuzzy".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(search_messages(&conn, &fts_keyword).unwrap().total, 1);
+        let short_keyword = SearchQuery {
+            keyword: "假".to_string(),
+            keyword_mode: "fuzzy".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(search_messages(&conn, &short_keyword).unwrap().total, 1);
 
         let exact = SearchQuery {
             keyword: "收到".to_string(),
@@ -1517,6 +1832,45 @@ mod flow_tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 升级到 FTS 索引时，已有消息必须被完整重建，否则搜索会漏数据。
+    #[test]
+    fn search_index_rebuilds_existing_messages() {
+        let (mut conn, path) = temp_conn();
+        let groups = vec![WxGroupInput {
+            id: "g-a@chatroom".to_string(),
+            name: "班级群A".to_string(),
+            member_count: 5,
+            last_active: Some(1_700_000_200),
+            kind: "group".to_string(),
+        }];
+        let messages = vec![msg(
+            "g-a@chatroom",
+            1,
+            1_700_000_000,
+            "张三",
+            "周六上课记得带书",
+        )];
+        apply_wechat_sync(&mut conn, &groups, &messages, &[], &[]).unwrap();
+
+        // 模拟旧库升级：索引为空、版本标记缺失。
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')", [])
+            .unwrap();
+        conn.execute("DELETE FROM settings WHERE key = 'search_fts_version'", [])
+            .unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+        let query = SearchQuery {
+            keyword: "上课记得".to_string(),
+            keyword_mode: "fuzzy".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(search_messages(&conn, &query).unwrap().total, 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn capture_scope_limits_visible_content() {
         let (mut conn, path) = temp_conn();
@@ -1526,12 +1880,14 @@ mod flow_tests {
                 name: "班级群A".to_string(),
                 member_count: 5,
                 last_active: Some(1_700_000_200),
+                kind: "group".to_string(),
             },
             WxGroupInput {
                 id: "g-b@chatroom".to_string(),
                 name: "班级群B".to_string(),
                 member_count: 5,
                 last_active: Some(1_700_100_000),
+                kind: "group".to_string(),
             },
         ];
         let messages = vec![
@@ -1540,7 +1896,7 @@ mod flow_tests {
             msg("g-b@chatroom", 3, 1_700_000_200, "王五", "另一个群"),
             msg("g-b@chatroom", 4, 1_700_000_300, "张三", "另一个群里的张三"),
         ];
-        apply_wechat_sync(&mut conn, &groups, &messages, &[]).unwrap();
+        apply_wechat_sync(&mut conn, &groups, &messages, &[], &[]).unwrap();
 
         // 未配置时全部可见
         assert_eq!(list_groups_scoped(&conn).unwrap().len(), 2);
@@ -1595,13 +1951,14 @@ mod flow_tests {
             name: "测试群".to_string(),
             member_count: 1,
             last_active: Some(1_700_000_000),
+            kind: "group".to_string(),
         }];
         let avatar = WxAvatarInput {
             entity_id: "wxid_test".to_string(),
             mime: "image/jpeg".to_string(),
             data: "AAAA".to_string(),
         };
-        apply_wechat_sync(&mut conn, &groups, &[], &[avatar]).unwrap();
+        apply_wechat_sync(&mut conn, &groups, &[], &[avatar], &[]).unwrap();
         let listed = list_avatars(&conn).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].entity_id, "wxid_test");
@@ -1612,11 +1969,86 @@ mod flow_tests {
             mime: "image/png".to_string(),
             data: "BBBB".to_string(),
         };
-        apply_wechat_sync(&mut conn, &groups, &[], &[updated]).unwrap();
+        apply_wechat_sync(&mut conn, &groups, &[], &[updated], &[]).unwrap();
         let listed = list_avatars(&conn).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].mime, "image/png");
         assert_eq!(listed[0].data, "BBBB");
+
+        // 群成员没有本地头像时，头像地址要能存下来供按需下载。
+        let urls = vec![WxAvatarUrlInput {
+            entity_id: "wxid_member".to_string(),
+            url: "https://wx.qlogo.cn/mmhead/abc/132".to_string(),
+        }];
+        apply_wechat_sync(&mut conn, &groups, &[], &[], &urls).unwrap();
+        let listed_urls = list_avatar_urls(&conn).unwrap();
+        assert_eq!(listed_urls.len(), 1);
+        assert_eq!(listed_urls[0].entity_id, "wxid_member");
+        assert_eq!(
+            avatar_url(&conn, "wxid_member").unwrap().as_deref(),
+            Some("https://wx.qlogo.cn/mmhead/abc/132")
+        );
+        assert!(avatar_url(&conn, "wxid_missing").unwrap().is_none());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn followed_people_roundtrip() {
+        let (mut conn, path) = temp_conn();
+        let groups = vec![
+            WxGroupInput {
+                id: "g-a@chatroom".to_string(),
+                name: "班级群A".to_string(),
+                member_count: 5,
+                last_active: Some(1_700_000_100),
+                kind: "group".to_string(),
+            },
+            WxGroupInput {
+                id: "wxid_lisi".to_string(),
+                name: "李四".to_string(),
+                member_count: 2,
+                last_active: Some(1_700_000_200),
+                kind: "private".to_string(),
+            },
+        ];
+        let messages = vec![
+            msg("g-a@chatroom", 1, 1_700_000_000, "张三", "群里消息"),
+            msg("wxid_lisi", 2, 1_700_000_200, "wxid_lisi", "单聊消息"),
+        ];
+        apply_wechat_sync(&mut conn, &groups, &messages, &[], &[]).unwrap();
+
+        // 关注后可以在关注列表看到跨群/单聊的聚合结果
+        set_followed(&conn, "wxid_lisi", "李四", true).unwrap();
+        let followed = list_followed_people(&conn, "").unwrap();
+        assert_eq!(followed.len(), 1);
+        assert_eq!(followed[0].message_count, 1);
+        assert_eq!(followed[0].group_count, 1);
+        assert!(followed[0].is_followed);
+
+        // 没有消息的人也能保留在关注列表
+        set_followed(&conn, "wxid_ghost", "暂无消息的人", true).unwrap();
+        let followed = list_followed_people(&conn, "").unwrap();
+        assert_eq!(followed.len(), 2);
+        assert!(followed
+            .iter()
+            .any(|person| person.sender_id == "wxid_ghost" && person.message_count == 0));
+
+        // 取消关注后移除
+        set_followed(&conn, "wxid_lisi", "李四", false).unwrap();
+        let followed = list_followed_people(&conn, "").unwrap();
+        assert_eq!(followed.len(), 1);
+        assert_eq!(followed[0].sender_id, "wxid_ghost");
+
+        let groups = list_groups(&conn).unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .find(|group| group.id == "wxid_lisi")
+                .map(|group| group.kind.as_str()),
+            Some("private")
+        );
 
         drop(conn);
         let _ = std::fs::remove_file(&path);

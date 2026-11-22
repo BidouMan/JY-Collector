@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppendReport,
   Avatar,
+  AvatarUrl,
   Bootstrap,
   CaptureScope,
   FieldSchema,
@@ -55,6 +56,12 @@ export interface SourceStatus {
   lastSyncedAt: string;
 }
 
+export interface ImagePayload {
+  mime: string;
+  /** 图片 base64，不含 data: 前缀 */
+  data: string;
+}
+
 export interface ExtractColumnInput {
   key: string;
   label: string;
@@ -74,6 +81,14 @@ export interface ExtractedMessage {
   rows: Record<string, string>[];
 }
 
+export interface SheetColumnPayload {
+  source: number;
+  label: string;
+  hint: string;
+  width: number;
+  format: string;
+}
+
 export const api = {
   bootstrap: () => invoke<Bootstrap>("bootstrap"),
 
@@ -87,10 +102,25 @@ export const api = {
 
   listAvatars: () => invoke<Avatar[]>("list_avatars"),
 
+  listAvatarUrls: () => invoke<AvatarUrl[]>("list_avatar_urls"),
+
+  loadAvatar: (entityId: string) => invoke<ImagePayload>("load_avatar", { entityId }),
+
   syncAvatars: () => invoke<number>("sync_avatars"),
+
+  loadMessageImage: (md5Hex: string, full = false) =>
+    invoke<ImagePayload>("load_message_image", { md5Hex, full }),
+
+  loadMessageEmoticon: (messageId: string) =>
+    invoke<ImagePayload>("load_message_emoticon", { messageId }),
 
   searchPeople: (keyword: string, scoped = false) =>
     invoke<Person[]>("search_people", { keyword, scoped }),
+
+  listFollowed: (keyword = "") => invoke<Person[]>("list_followed", { keyword }),
+
+  toggleFollow: (senderId: string, senderName: string, followed: boolean) =>
+    invoke<void>("toggle_follow", { senderId, senderName, followed }),
 
   getCaptureScope: () => invoke<CaptureScope>("get_capture_scope"),
 
@@ -143,11 +173,23 @@ export const api = {
   readSheetData: (templateId: string) =>
     invoke<SheetTable>("read_sheet_data", { templateId }),
 
+  readTemplateSheets: (templateId: string) =>
+    invoke<SheetInfo[]>("read_template_sheets", { templateId }),
+
+  readSheetDataNamed: (templateId: string, sheetName: string) =>
+    invoke<SheetTable>("read_sheet_data_named", { templateId, sheetName }),
+
   updateSheetRow: (templateId: string, row: number, values: (string | null)[]) =>
     invoke<void>("update_sheet_row", { templateId, row, values }),
 
   deleteSheetRow: (templateId: string, row: number) =>
     invoke<void>("delete_sheet_row", { templateId, row }),
+
+  reorderSheetRows: (templateId: string, rows: number[]) =>
+    invoke<void>("reorder_sheet_rows", { templateId, rows }),
+
+  saveSheetColumns: (templateId: string, columns: SheetColumnPayload[]) =>
+    invoke<void>("save_sheet_columns", { templateId, columns }),
 
   appendSheetRow: (templateId: string, values: string[]) =>
     invoke<number>("append_sheet_row", { templateId, values }),

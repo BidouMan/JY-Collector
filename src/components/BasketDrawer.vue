@@ -7,6 +7,7 @@ import { basket, clearBasketNow, removeFromBasket } from "../stores/basket";
 import { notify } from "../toast";
 import type { Template } from "../types";
 import { formatTime } from "../utils";
+import { replaceWechatEmoji } from "../wechatEmoji";
 
 const emit = defineEmits<{ changed: [] }>();
 
@@ -183,7 +184,7 @@ if (basket.open && templates.value.length === 0) void loadTemplates();
           </span>
           <button class="text-btn" @click="remove(item.id)">移除</button>
         </div>
-        <div class="basket-item-text">{{ item.content }}</div>
+        <div class="basket-item-text">{{ replaceWechatEmoji(item.content) }}</div>
       </div>
       <div v-if="filteredItems.length === 0" class="empty">
         <div class="empty-title">没有匹配的消息</div>

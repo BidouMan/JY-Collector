@@ -1,10 +1,12 @@
 import type { MessageType } from "./types";
+import { replaceWechatEmoji } from "./wechatEmoji";
 
 export const TYPE_LABEL: Record<MessageType, string> = {
   text: "文本",
   quote: "引用",
   image: "图片",
   file: "文件",
+  emoticon: "表情",
 };
 
 function localDate(offsetDays = 0): string {
@@ -36,14 +38,19 @@ export interface TextPart {
 }
 
 export function splitHighlight(text: string, snippet?: string | null): TextPart[] {
-  if (!snippet) return [{ text, mark: false }];
-  const index = text.indexOf(snippet);
-  if (index < 0) return [{ text, mark: false }];
+  // 先统一转换默认表情，再按转换后的文本定位高亮，避免把 "[强]" 拆成
+  // "[" + 高亮"强" + "]" 而显示不出表情。
+  const whole = replaceWechatEmoji(text);
+  const target = snippet ? replaceWechatEmoji(snippet) : "";
+  if (!target) return [{ text: whole, mark: false }];
+  // 与后端 LIKE / COLLATE NOCASE 保持一致，英文不区分大小写。
+  const index = whole.toLowerCase().indexOf(target.toLowerCase());
+  if (index < 0) return [{ text: whole, mark: false }];
   const parts: TextPart[] = [];
-  if (index > 0) parts.push({ text: text.slice(0, index), mark: false });
-  parts.push({ text: snippet, mark: true });
-  const end = index + snippet.length;
-  if (end < text.length) parts.push({ text: text.slice(end), mark: false });
+  if (index > 0) parts.push({ text: whole.slice(0, index), mark: false });
+  parts.push({ text: whole.slice(index, index + target.length), mark: true });
+  const end = index + target.length;
+  if (end < whole.length) parts.push({ text: whole.slice(end), mark: false });
   return parts;
 }
 

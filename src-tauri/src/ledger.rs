@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
+#[derive(Clone)]
 pub enum CellValue {
     Text(String),
     Number(f64),
@@ -605,23 +606,18 @@ pub fn read_sheet_table(
 
     let mut rows: Vec<SheetRowData> = parsed
         .iter()
-        .filter(|row| row.index > header_row)
-        .filter_map(|row| {
+        .filter(|row| row.index > header_row && !row.cells.is_empty())
+        .map(|row| {
             let mut cells = vec![String::new(); max_col as usize];
-            let mut has_content = false;
             for cell in &row.cells {
                 if cell.col >= 1 && cell.col as usize <= cells.len() {
-                    let text = cell.text.trim().to_string();
-                    if !text.is_empty() {
-                        has_content = true;
-                    }
-                    cells[(cell.col - 1) as usize] = text;
+                    cells[(cell.col - 1) as usize] = cell.text.trim().to_string();
                 }
             }
-            has_content.then(|| SheetRowData {
+            SheetRowData {
                 index: row.index,
                 cells,
-            })
+            }
         })
         .collect();
     rows.sort_by_key(|row| row.index);
@@ -704,6 +700,416 @@ pub fn delete_row(path: &Path, sheet_name: &str, row_index: u32) -> Result<(), S
     write_archive(path, &sheet.part, &updated)
 }
 
+pub struct ColumnSpec {
+    /// 原 Excel 列号；0 表示新增列。
+    pub source: u32,
+    pub label: String,
+    pub width: u32,
+}
+
+/// 按给定的列顺序重建所有行：支持改名、拖拽换位、删除和新增列，
+/// 同时把列宽写回工作表的 `<cols>`。
+pub fn save_columns(
+    path: &Path,
+    sheet_name: &str,
+    header_row: u32,
+    columns: &[ColumnSpec],
+) -> Result<(), String> {
+    if columns.is_empty() {
+        return Err("至少保留一列".to_string());
+    }
+    check_writable(path)?;
+    let sheet = load_sheet_xml(path, sheet_name)?;
+    if sheet.xml.contains("<f>") || sheet.xml.contains("<f ") {
+        return Err("工作表含有公式，调整列会破坏公式引用，请直接在 Excel 中操作".to_string());
+    }
+    if sheet.xml.contains("<mergeCell") {
+        return Err("工作表含有合并单元格，请直接在 Excel 中调整列".to_string());
+    }
+    let header_row = header_row.max(1);
+    let spans = row_spans(&sheet.xml);
+    if spans.is_empty() {
+        return Err("工作表里没有数据".to_string());
+    }
+    let parsed = parse_sheet(&sheet.xml, &sheet.shared);
+    let header_style = parsed
+        .iter()
+        .find(|row| row.index == header_row)
+        .and_then(|row| row.cells.iter().find_map(|cell| cell.style.clone()));
+    let mut max_source = 0u32;
+    let mut seen_sources = HashMap::new();
+    for row in &parsed {
+        for cell in &row.cells {
+            max_source = max_source.max(cell.col);
+        }
+    }
+    for column in columns {
+        if column.source > 0 {
+            if column.source > max_source {
+                return Err("列不存在，请刷新后重试".to_string());
+            }
+            if seen_sources.insert(column.source, true).is_some() {
+                return Err("列设置有重复，请刷新后重试".to_string());
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(sheet.xml.len());
+    let mut cursor = 0;
+    let mut max_row = 0;
+    for (index, start, end) in &spans {
+        if *start < cursor {
+            continue;
+        }
+        out.push_str(&sheet.xml[cursor..*start]);
+        let block = &sheet.xml[*start..*end];
+        let rebuilt = if *index == header_row {
+            rebuild_columns_row(block, columns, true, header_style.as_deref())?
+        } else if *index > header_row {
+            rebuild_columns_row(block, columns, false, header_style.as_deref())?
+        } else {
+            block.to_string()
+        };
+        out.push_str(&rebuilt);
+        max_row = max_row.max(*index);
+        cursor = *end;
+    }
+    out.push_str(&sheet.xml[cursor..]);
+
+    let with_cols = replace_column_widths(&out, columns);
+    let updated = if max_row > 0 {
+        update_dimension(&with_cols, max_row, columns.len() as u32)
+    } else {
+        with_cols
+    };
+    write_archive(path, &sheet.part, &updated)
+}
+
+fn rebuild_columns_row(
+    block: &str,
+    columns: &[ColumnSpec],
+    is_header: bool,
+    header_style: Option<&str>,
+) -> Result<String, String> {
+    let tag_offset = block.find('>').ok_or_else(|| "行结构异常".to_string())?;
+    let open_tag = &block[..=tag_offset];
+    let self_closing = open_tag.trim_end().ends_with("/>");
+    let row_index = row_index_from_tag(open_tag).unwrap_or(0);
+    let cells = collect_row_cells(block, tag_offset + 1);
+
+    let mut out_cells = String::new();
+    for (position, column) in columns.iter().enumerate() {
+        let dest = position as u32 + 1;
+        let source_cell = if column.source > 0 {
+            cells.iter().find(|cell| cell.col == column.source)
+        } else {
+            None
+        };
+        if is_header {
+            let style = source_cell
+                .and_then(|cell| cell.style.as_deref())
+                .or(header_style);
+            out_cells.push_str(&cell_xml(
+                dest,
+                row_index,
+                &CellValue::Text(column.label.clone()),
+                style,
+            ));
+        } else if let Some(cell) = source_cell {
+            out_cells.push_str(&shift_cell_column(&block[cell.start..cell.end], dest));
+        }
+    }
+
+    let base_tag = if self_closing {
+        format!("{}>", open_tag[..open_tag.len() - 2].trim_end())
+    } else {
+        open_tag.to_string()
+    };
+    Ok(format!("{}{}</row>", base_tag, out_cells))
+}
+
+fn replace_column_widths(xml: &str, columns: &[ColumnSpec]) -> String {
+    let without_cols = remove_cols_block(xml);
+    let Some(position) = without_cols.find("<sheetData") else {
+        return without_cols;
+    };
+    let mut block = String::from("<cols>");
+    for (index, column) in columns.iter().enumerate() {
+        let width = column.width.clamp(6, 80);
+        block.push_str(&format!(
+            "<col min=\"{}\" max=\"{}\" width=\"{}\" customWidth=\"1\"/>",
+            index + 1,
+            index + 1,
+            width
+        ));
+    }
+    block.push_str("</cols>");
+    let mut out = String::with_capacity(without_cols.len() + block.len());
+    out.push_str(&without_cols[..position]);
+    out.push_str(&block);
+    out.push_str(&without_cols[position..]);
+    out
+}
+
+fn remove_cols_block(xml: &str) -> String {
+    let Some(start) = xml.find("<cols") else {
+        return xml.to_string();
+    };
+    let Some(tag_offset) = xml[start..].find('>') else {
+        return xml.to_string();
+    };
+    let tag_end = start + tag_offset + 1;
+    if xml[start..tag_end].trim_end().ends_with("/>") {
+        let mut out = String::with_capacity(xml.len());
+        out.push_str(&xml[..start]);
+        out.push_str(&xml[tag_end..]);
+        return out;
+    }
+    let Some(close_offset) = xml[tag_end..].find("</cols>") else {
+        return xml.to_string();
+    };
+    let close_end = tag_end + close_offset + "</cols>".len();
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..start]);
+    out.push_str(&xml[close_end..]);
+    out
+}
+
+/// 删除一列：从每一行移除该列，后面的列整体左移。
+pub fn remove_column(path: &Path, sheet_name: &str, column: u32) -> Result<(), String> {
+    if column == 0 {
+        return Err("列号无效".to_string());
+    }
+    check_writable(path)?;
+    let sheet = load_sheet_xml(path, sheet_name)?;
+    if sheet.xml.contains("<f>") || sheet.xml.contains("<f ") {
+        return Err("工作表含有公式，删除列会破坏公式引用，请直接在 Excel 中操作".to_string());
+    }
+    if sheet.xml.contains("<mergeCell") {
+        return Err("工作表含有合并单元格，请直接在 Excel 中删除列".to_string());
+    }
+    let spans = row_spans(&sheet.xml);
+    if spans.is_empty() {
+        return Err("工作表里没有数据".to_string());
+    }
+
+    let mut out = String::with_capacity(sheet.xml.len());
+    let mut cursor = 0;
+    let mut max_col = 0u32;
+    let mut max_row = 0u32;
+    for (index, start, end) in &spans {
+        if *start < cursor {
+            continue;
+        }
+        out.push_str(&sheet.xml[cursor..*start]);
+        let (block, block_max_col) = remove_column_from_row(&sheet.xml[*start..*end], column)?;
+        out.push_str(&block);
+        max_col = max_col.max(block_max_col);
+        max_row = max_row.max(*index);
+        cursor = *end;
+    }
+    out.push_str(&sheet.xml[cursor..]);
+
+    let shifted = adjust_column_definitions(&out, column);
+    let updated = if max_row > 0 && max_col > 0 {
+        update_dimension(&shifted, max_row, max_col)
+    } else {
+        shifted
+    };
+    write_archive(path, &sheet.part, &updated)
+}
+
+/// 同步调整 `<cols>` 里的列宽定义，避免删列后宽度错位。
+fn adjust_column_definitions(xml: &str, removed: u32) -> String {
+    let Some(start) = xml.find("<cols") else {
+        return xml.to_string();
+    };
+    let Some(start_end_offset) = xml[start..].find('>') else {
+        return xml.to_string();
+    };
+    let start_end = start + start_end_offset + 1;
+    let open_tag = &xml[start..start_end];
+    if open_tag.trim_end().ends_with("/>") {
+        return xml.to_string();
+    }
+    let Some(close_offset) = xml[start_end..].find("</cols>") else {
+        return xml.to_string();
+    };
+    let close = start_end + close_offset;
+    let close_end = close + "</cols>".len();
+
+    let inner = &xml[start_end..close];
+    let mut rebuilt = String::new();
+    let mut cursor = 0;
+    while let Some(relative) = inner[cursor..].find("<col") {
+        let col_start = cursor + relative;
+        let next = inner.as_bytes().get(col_start + 4).copied();
+        if !matches!(next, Some(b' ') | Some(b'>') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+            rebuilt.push_str(&inner[cursor..col_start + 4]);
+            cursor = col_start + 4;
+            continue;
+        }
+        let Some(tag_offset) = inner[col_start..].find('>') else {
+            break;
+        };
+        let tag_end = col_start + tag_offset + 1;
+        rebuilt.push_str(&inner[cursor..col_start]);
+        let tag = &inner[col_start..tag_end];
+        if let Some(adjusted) = adjust_col_tag(tag, removed) {
+            rebuilt.push_str(&adjusted);
+        }
+        cursor = tag_end;
+    }
+    rebuilt.push_str(&inner[cursor..]);
+
+    if rebuilt.trim().is_empty() {
+        let mut out = String::with_capacity(xml.len());
+        out.push_str(&xml[..start]);
+        out.push_str(&xml[close_end..]);
+        out
+    } else {
+        format!("{}{}{}</cols>{}", &xml[..start], open_tag, rebuilt, &xml[close_end..])
+    }
+}
+
+fn adjust_col_tag(tag: &str, removed: u32) -> Option<String> {
+    let min = attr_of(tag, "min")?.parse::<u32>().ok()?;
+    let max = attr_of(tag, "max")?.parse::<u32>().ok()?;
+    if max < removed {
+        return Some(tag.to_string());
+    }
+    if min > removed {
+        let tag = replace_attr(tag, "min", &(min - 1).to_string());
+        return Some(replace_attr(&tag, "max", &(max - 1).to_string()));
+    }
+    if min >= max {
+        return None;
+    }
+    Some(replace_attr(tag, "max", &(max - 1).to_string()))
+}
+
+fn replace_attr(tag: &str, key: &str, value: &str) -> String {
+    let Some(current) = attr_of(tag, key) else {
+        return tag.to_string();
+    };
+    tag.replacen(
+        &format!("{}=\"{}\"", key, current),
+        &format!("{}=\"{}\"", key, value),
+        1,
+    )
+}
+
+fn remove_column_from_row(block: &str, column: u32) -> Result<(String, u32), String> {
+    let tag_offset = block
+        .find('>')
+        .ok_or_else(|| "行结构异常".to_string())?;
+    let open_tag = &block[..=tag_offset];
+    let self_closing = open_tag.trim_end().ends_with("/>");
+    let cells = collect_row_cells(block, tag_offset + 1);
+
+    let mut out_cells = String::new();
+    let mut max_col = 0u32;
+    for cell in &cells {
+        if cell.col == column {
+            continue;
+        }
+        if cell.col > column {
+            let new_col = cell.col - 1;
+            out_cells.push_str(&shift_cell_column(&block[cell.start..cell.end], new_col));
+            max_col = max_col.max(new_col);
+        } else {
+            out_cells.push_str(&block[cell.start..cell.end]);
+            max_col = max_col.max(cell.col);
+        }
+    }
+
+    let base_tag = if self_closing {
+        format!("{}>", open_tag[..open_tag.len() - 2].trim_end())
+    } else {
+        open_tag.to_string()
+    };
+    Ok((format!("{}{}</row>", base_tag, out_cells), max_col))
+}
+
+fn shift_cell_column(cell: &str, new_col: u32) -> String {
+    let Some(reference) = attr_of(cell, "r") else {
+        return cell.to_string();
+    };
+    let row_part: String = reference
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect();
+    let replacement = format!("r=\"{}{}\"", index_to_col(new_col), row_part);
+    cell.replacen(&format!("r=\"{}\"", reference), &replacement, 1)
+}
+
+/// 按前端给出的新顺序重排数据行。
+/// `order` 里是每一行调整前的 Excel 行号，按新的从上到下顺序排列；
+/// 行号本身不变，只把行内容搬到对应的物理行上，空行位置保持不动。
+pub fn reorder_rows(
+    path: &Path,
+    sheet_name: &str,
+    header_row: u32,
+    order: &[u32],
+) -> Result<(), String> {
+    check_writable(path)?;
+    let sheet = load_sheet_xml(path, sheet_name)?;
+    if sheet.xml.contains("<f>") || sheet.xml.contains("<f ") {
+        return Err("工作表含有公式，调整行顺序会破坏公式引用，请直接在 Excel 中操作".to_string());
+    }
+    if sheet.xml.contains("<mergeCell") {
+        return Err("工作表含有合并单元格，请直接在 Excel 中调整行顺序".to_string());
+    }
+    let header_row = header_row.max(1);
+    let spans = row_spans(&sheet.xml);
+    let data_spans: Vec<(u32, usize, usize)> = spans
+        .iter()
+        .filter(|(index, _, _)| *index > header_row)
+        .cloned()
+        .collect();
+    if data_spans.is_empty() {
+        return Err("表格里没有可调整的数据行".to_string());
+    }
+
+    let mut slots: Vec<u32> = data_spans.iter().map(|(index, _, _)| *index).collect();
+    slots.sort_unstable();
+    let mut provided = order.to_vec();
+    provided.sort_unstable();
+    if slots != provided {
+        return Err("表格内容已变化，请刷新后再调整顺序".to_string());
+    }
+
+    let mut blocks: HashMap<u32, &str> = HashMap::new();
+    for (index, start, end) in &data_spans {
+        blocks.insert(*index, &sheet.xml[*start..*end]);
+    }
+    let mut replacements: HashMap<u32, String> = HashMap::new();
+    for (position, slot) in slots.iter().enumerate() {
+        let source = order[position];
+        let block = blocks
+            .get(&source)
+            .ok_or_else(|| "表格内容已变化，请刷新后再调整顺序".to_string())?;
+        replacements.insert(*slot, renumber_row_block(block, *slot));
+    }
+
+    let mut out = String::with_capacity(sheet.xml.len());
+    let mut cursor = 0;
+    for (index, start, end) in &spans {
+        if *start < cursor {
+            continue;
+        }
+        out.push_str(&sheet.xml[cursor..*start]);
+        if let Some(replacement) = replacements.get(index) {
+            out.push_str(replacement);
+        } else {
+            out.push_str(&sheet.xml[*start..*end]);
+        }
+        cursor = *end;
+    }
+    out.push_str(&sheet.xml[cursor..]);
+    write_archive(path, &sheet.part, &out)
+}
+
 /// 在表格末尾追加一行，列按位置对齐。
 pub fn append_row_aligned(
     path: &Path,
@@ -722,9 +1128,6 @@ pub fn append_row_aligned(
     for (index, value) in values.iter().enumerate() {
         let col = index as u32 + 1;
         new_max_col = new_max_col.max(col);
-        if value.is_empty() {
-            continue;
-        }
         cells.push_str(&cell_xml(col, row_index, value, None));
     }
     let row_xml = format!("<row r=\"{}\">{}</row>", row_index, cells);
@@ -802,6 +1205,8 @@ fn rebuild_row(
     for cell in &cells {
         max_col = max_col.max(cell.col);
     }
+    // 新增列时没有原单元格，沿用本行已有单元格的样式，让新表头和其它表头一致。
+    let fallback_style = cells.iter().find_map(|cell| cell.style.clone());
     let mut out_cells = String::new();
     for col in 1..=max_col {
         let existing = cells.iter().find(|cell| cell.col == col);
@@ -818,7 +1223,9 @@ fn rebuild_row(
                     col,
                     row_index,
                     value,
-                    existing.and_then(|cell| cell.style.as_deref()),
+                    existing
+                        .and_then(|cell| cell.style.as_deref())
+                        .or(fallback_style.as_deref()),
                 ));
             }
             _ => {
@@ -1566,6 +1973,147 @@ mod tests {
         assert_eq!(table.rows[0].cells, vec!["B院", "乙商"]);
         assert_eq!(table.rows[1].index, 3);
         assert_eq!(table.rows[1].cells, vec!["C院", "3"]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reorder_rows_follows_given_order() {
+        let path = std::env::temp_dir().join(format!(
+            "jy-ledger-reorder-{}.xlsx",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        append_to_workbook(
+            &path,
+            "数据",
+            1,
+            &["医院".to_string()],
+            &[
+                vec![CellValue::Text("A院".into())],
+                vec![CellValue::Text("B院".into())],
+                vec![CellValue::Text("C院".into())],
+            ],
+        )
+        .unwrap();
+
+        // 把第 3 行拖到第 2 行上面。
+        reorder_rows(&path, "数据", 1, &[3, 2, 4]).unwrap();
+        let table = read_sheet_table(&path, "数据", 1).unwrap();
+        assert_eq!(
+            table.rows.iter().map(|row| row.index).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(table.rows[0].cells, vec!["B院"]);
+        assert_eq!(table.rows[1].cells, vec!["A院"]);
+        assert_eq!(table.rows[2].cells, vec!["C院"]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_column_shifts_cells_left() {
+        let path = std::env::temp_dir().join(format!(
+            "jy-ledger-remove-col-{}.xlsx",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        append_to_workbook(
+            &path,
+            "数据",
+            1,
+            &["A".to_string(), "B".to_string(), "C".to_string()],
+            &[
+                vec![
+                    CellValue::Text("a1".into()),
+                    CellValue::Text("b1".into()),
+                    CellValue::Text("c1".into()),
+                ],
+                vec![
+                    CellValue::Text("a2".into()),
+                    CellValue::Text("b2".into()),
+                    CellValue::Text("c2".into()),
+                ],
+            ],
+        )
+        .unwrap();
+
+        remove_column(&path, "数据", 2).unwrap();
+        let table = read_sheet_table(&path, "数据", 1).unwrap();
+        assert_eq!(table.headers, vec!["A", "C"]);
+        assert_eq!(table.rows[0].cells, vec!["a1", "c1"]);
+        assert_eq!(table.rows[1].cells, vec!["a2", "c2"]);
+
+        remove_column(&path, "数据", 1).unwrap();
+        let table = read_sheet_table(&path, "数据", 1).unwrap();
+        assert_eq!(table.headers, vec!["C"]);
+        assert_eq!(table.rows[0].cells, vec!["c1"]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_columns_renames_reorders_and_adds() {
+        let path = std::env::temp_dir().join(format!(
+            "jy-ledger-save-cols-{}.xlsx",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        append_to_workbook(
+            &path,
+            "数据",
+            1,
+            &["A".to_string(), "B".to_string(), "C".to_string()],
+            &[
+                vec![
+                    CellValue::Text("a1".into()),
+                    CellValue::Text("b1".into()),
+                    CellValue::Text("c1".into()),
+                ],
+                vec![
+                    CellValue::Text("a2".into()),
+                    CellValue::Text("b2".into()),
+                    CellValue::Text("c2".into()),
+                ],
+            ],
+        )
+        .unwrap();
+
+        // B 提到第一列并改名，新增 D，A 放到第三列，C 删除。
+        save_columns(
+            &path,
+            "数据",
+            1,
+            &[
+                ColumnSpec {
+                    source: 2,
+                    label: "B新".into(),
+                    width: 20,
+                },
+                ColumnSpec {
+                    source: 0,
+                    label: "D".into(),
+                    width: 18,
+                },
+                ColumnSpec {
+                    source: 1,
+                    label: "A".into(),
+                    width: 24,
+                },
+            ],
+        )
+        .unwrap();
+
+        let table = read_sheet_table(&path, "数据", 1).unwrap();
+        assert_eq!(table.headers, vec!["B新", "D", "A"]);
+        assert_eq!(table.rows[0].cells, vec!["b1", "", "a1"]);
+        assert_eq!(table.rows[1].cells, vec!["b2", "", "a2"]);
 
         let _ = fs::remove_file(&path);
     }

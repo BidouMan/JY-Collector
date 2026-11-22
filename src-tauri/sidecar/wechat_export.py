@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -159,6 +160,34 @@ def _sanitize_label(value: str | None) -> str:
     return _clean(text.splitlines()[0]) if text else ""
 
 
+def _decode_emoticon(raw) -> dict:
+    """表情消息：保留 md5 与原始下载地址，供界面按需取图。
+
+    本地表情缓存是加密的，且没有稳定可派生的密钥；消息 XML 里的 cdnurl
+    可以直接取到原图，因此这里记录地址，由 Rust 侧按需下载（不落盘）。
+    """
+    blob = raw
+    if isinstance(blob, str):
+        blob = blob.encode("utf-8", "surrogateescape")
+    if blob is None:
+        return {"type": "text", "content": "[表情]"}
+    blob = _strip_zstd(blob)
+    text = _as_text(blob)
+    emoji = re.search(r"<emoji[^>]*>", text)
+    if not emoji:
+        return {"type": "text", "content": "[表情]"}
+    attrs = dict(re.findall(r'(\w+)="([^"]*)"', emoji.group(0)))
+    url = (attrs.get("thumburl") or attrs.get("tpurl")
+           or attrs.get("cdnurl") or attrs.get("encrypturl") or "")
+    return {
+        "type": "emoticon",
+        "content": _clean(html.unescape(attrs.get("desc") or "")) or "[表情]",
+        "emoticonMd5": (attrs.get("md5") or "").lower() or None,
+        "emoticonUrl": html.unescape(url) or None,
+        "emoticonKey": (attrs.get("aeskey") or "").lower() or None,
+    }
+
+
 def _decode_message(raw, local_type: int, sender: str) -> dict:
     """把一条 message_content 归一化为界面需要的 (type, content, quote, file...)。"""
     base = local_type & _BASE_MASK
@@ -172,7 +201,7 @@ def _decode_message(raw, local_type: int, sender: str) -> dict:
     if base == 43:
         return {"type": "text", "content": "[视频]"}
     if base == 47:
-        return {"type": "text", "content": "[表情]"}
+        return _decode_emoticon(raw)
     if base == 42:
         return {"type": "text", "content": "[名片]"}
     if base == 48:
@@ -261,6 +290,31 @@ def _load_contacts(con: sqlite3.Connection) -> dict[str, str]:
     return names
 
 
+def _load_avatar_urls(con: sqlite3.Connection) -> list[dict]:
+    """联系人表里每个联系人都带头像 CDN 地址（群成员也有）。
+
+    head_image.db 只缓存了部分人的头像，群成员往往不在里面；用联系人表的
+    地址按需下载即可补齐，不必把图片预先存进本地库。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for username, small, big, md5 in con.execute(
+            "SELECT username, small_head_url, big_head_url, head_img_md5 FROM contact"):
+        name = (username or "").strip()
+        if not name or name in seen:
+            continue
+        url = (small or "").strip() or (big or "").strip()
+        if not url:
+            digest = (md5 or "").strip().lower()
+            if len(digest) == 32 and all(ch in "0123456789abcdef" for ch in digest):
+                url = f"https://wx.qlogo.cn/mmhead/{digest}/132"
+        if not url.startswith("https://"):
+            continue
+        seen.add(name)
+        out.append({"entityId": name, "url": url})
+    return out
+
+
 def _load_rooms(con: sqlite3.Connection, contacts: dict[str, str]) -> list[dict]:
     member_counts: dict[int, int] = {}
     for room_id, count in con.execute(
@@ -273,6 +327,43 @@ def _load_rooms(con: sqlite3.Connection, contacts: dict[str, str]) -> list[dict]
             "id": username,
             "name": contacts.get(username) or username,
             "memberCount": member_counts.get(int(room_id), 0),
+            "kind": "group",
+        })
+    return rooms
+
+
+# 会话表里混着系统号、公众号、文件传输助手等，这些不是真实联系人。
+SPECIAL_SESSIONS = {
+    "filehelper", "weixin", "newsapp", "fmessage", "medianote", "floatbottle",
+    "qqmail", "tmessage", "qmessage", "officialaccounts",
+    "notification_messages", "weixinremind", "brandsessionholder",
+    "brandservicesessionholder", "exmail_tool", "notifymessage",
+}
+
+
+def _load_private_rooms(
+    sessions: dict[str, int],
+    contacts: dict[str, str],
+    available_tables: set[str],
+) -> list[dict]:
+    """从会话表补出真实联系人的单聊，排除系统号和公众号。
+
+    只保留消息库里存在消息表的会话，避免把从没聊过的联系人塞进列表。
+    """
+    rooms = []
+    for username in sessions:
+        if not username or username.endswith("@chatroom"):
+            continue
+        if username.lower() in SPECIAL_SESSIONS or username.startswith("gh_"):
+            continue
+        name = contacts.get(username)
+        if not name or _msg_table(username) not in available_tables:
+            continue
+        rooms.append({
+            "id": username,
+            "name": name,
+            "memberCount": 2,
+            "kind": "private",
         })
     return rooms
 
@@ -293,6 +384,48 @@ def _load_sender_ids(con: sqlite3.Connection) -> dict[int, str]:
     for rowid, username in con.execute("SELECT rowid, user_name FROM Name2Id"):
         out[int(rowid)] = username or ""
     return out
+
+
+def _load_image_md5(
+    storage: str, tmp_dir: str, passphrase: bytes
+) -> dict[tuple[str, int], str]:
+    """从 message_resource.db 建立 (群/联系人, local_id) -> 图片文件 md5 的映射。
+
+    消息库里的图片 XML md5 并不是本地 .dat 文件名；真正对应磁盘文件的是
+    资源库 packed_info 里的 32 位 md5。资源库读不到时降级为无图片预览。
+    """
+    src = os.path.join(storage, "message", "message_resource.db")
+    if not os.path.isfile(src):
+        return {}
+    try:
+        plain = os.path.join(tmp_dir, "message_resource.db")
+        bad = _decrypt_to(src, plain, passphrase)
+        if bad:
+            log(f"消息资源库有 {bad} 页校验失败，已跳过图片索引")
+            return {}
+        con = _open_plain(plain)
+        try:
+            chats = {
+                int(rowid): name
+                for rowid, name in con.execute("SELECT rowid, user_name FROM ChatName2Id")
+            }
+            out: dict[tuple[str, int], str] = {}
+            for chat_id, local_id, packed in con.execute(
+                "SELECT chat_id, message_local_id, packed_info "
+                "FROM MessageResourceInfo WHERE message_local_type = 3"
+            ):
+                if not packed:
+                    continue
+                match = re.search(rb"[0-9a-fA-F]{32}", bytes(packed))
+                name = chats.get(int(chat_id))
+                if match and name:
+                    out[(name, int(local_id))] = match.group(0).decode().lower()
+            return out
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        log(f"读取消息资源库失败，图片将只显示占位：{exc}")
+        return {}
 
 
 def _image_mime(blob: bytes) -> str | None:
@@ -345,13 +478,37 @@ def _load_avatars(storage: str, tmp_dir: str, passphrase: bytes) -> list[dict]:
     return avatars
 
 
+def _load_contact_avatar_urls(
+    storage: str, tmp_dir: str, passphrase: bytes
+) -> list[dict]:
+    """只解联系人库，取出头像 CDN 地址（群成员也能覆盖到）。"""
+    src = os.path.join(storage, "contact", "contact.db")
+    if not os.path.isfile(src):
+        return []
+    try:
+        plain = os.path.join(tmp_dir, "contact.db")
+        bad = _decrypt_to(src, plain, passphrase)
+        if bad:
+            log(f"联系人库有 {bad} 页校验失败，已跳过头像地址")
+            return []
+        con = _open_plain(plain)
+        try:
+            return _load_avatar_urls(con)
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        log(f"读取联系人头像地址失败：{exc}")
+        return []
+
+
 def _msg_table(username: str) -> str:
     return "Msg_" + hashlib.md5(username.encode("utf-8")).hexdigest()
 
 
 def _collect_messages(con: sqlite3.Connection, rooms: list[dict],
                       sender_ids: dict[int, str], contacts: dict[str, str],
-                      since: dict[str, int]) -> tuple[list[dict], dict[str, int]]:
+                      since: dict[str, int],
+                      image_md5: dict[tuple[str, int], str] | None = None) -> tuple[list[dict], dict[str, int]]:
     tables = set(_tables(con))
     messages: list[dict] = []
     active: dict[str, int] = {}
@@ -395,6 +552,11 @@ def _collect_messages(con: sqlite3.Connection, rooms: list[dict],
                 "quotedContent": decoded.get("quotedContent"),
                 "fileName": decoded.get("fileName"),
                 "fileSize": decoded.get("fileSize"),
+                "imageMd5": (image_md5 or {}).get((room_id, int(local_id or 0)))
+                if decoded["type"] == "image" else None,
+                "emoticonMd5": decoded.get("emoticonMd5"),
+                "emoticonUrl": decoded.get("emoticonUrl"),
+                "emoticonKey": decoded.get("emoticonKey"),
                 "createdAt": ts,
             })
             count += 1
@@ -435,6 +597,7 @@ def export(request: dict) -> dict:
         contact_con = _open_plain(plain_contact)
         contacts = _load_contacts(contact_con)
         rooms = _load_rooms(contact_con, contacts)
+        avatar_urls = _load_avatar_urls(contact_con)
         contact_con.close()
 
         session_con = _open_plain(plain_session)
@@ -443,22 +606,39 @@ def export(request: dict) -> dict:
 
         all_messages: list[dict] = []
         active: dict[str, int] = {}
+        image_md5 = _load_image_md5(storage, tmp_dir, passphrase)
         shards = sorted(
             name for name in os.listdir(msg_dir)
             if re.fullmatch(r"message_\d+\.db", name)
         )
         if not shards:
             raise RuntimeError("未找到消息库分片（message_*.db）")
+
+        plain_shards: list[str] = []
         for shard in shards:
             plain_shard = os.path.join(tmp_dir, shard)
             bad = _decrypt_to(os.path.join(msg_dir, shard), plain_shard, passphrase)
             if bad:
                 log(f"{shard} 有 {bad} 页校验失败，已跳过")
+            plain_shards.append(plain_shard)
+
+        # 先汇总所有分片的消息表，用于判断单聊会话是否真的有消息可采。
+        available_tables: set[str] = set()
+        for plain_shard in plain_shards:
+            shard_con = _open_plain(plain_shard)
+            try:
+                available_tables |= set(_tables(shard_con))
+            finally:
+                shard_con.close()
+
+        rooms.extend(_load_private_rooms(sessions, contacts, available_tables))
+
+        for plain_shard in plain_shards:
             shard_con = _open_plain(plain_shard)
             try:
                 sender_ids = _load_sender_ids(shard_con)
                 msgs, act = _collect_messages(shard_con, rooms, sender_ids,
-                                              contacts, since)
+                                              contacts, since, image_md5)
             finally:
                 shard_con.close()
             all_messages.extend(msgs)
@@ -478,6 +658,7 @@ def export(request: dict) -> dict:
             "groups": rooms,
             "messages": all_messages,
             "avatars": avatars,
+            "avatarUrls": avatar_urls,
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -544,6 +725,7 @@ def probe_avatars(request: dict) -> dict:
         return {
             "account": account,
             "avatars": _load_avatars(storage, tmp_dir, passphrase),
+            "avatarUrls": _load_contact_avatar_urls(storage, tmp_dir, passphrase),
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

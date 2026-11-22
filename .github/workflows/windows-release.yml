@@ -1,0 +1,147 @@
+name: Windows Release
+
+# 推送 v* 标签或手动触发时，在 Windows 上构建并发布 Release。
+# 产物：currentUser 安装包（不触发 UAC）、免安装绿色版、SHA256SUMS.txt。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Frontend typecheck and build
+        run: npm run build
+
+      # 只打 NSIS（currentUser），不打 MSI，避免管理员权限与 WiX 依赖。
+      - name: Build Tauri app
+        run: npx --no-install tauri build --bundles nsis
+
+      - name: Package artifacts
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+          if ("${{ github.ref_type }}" -eq "tag") { $tag = "${{ github.ref_name }}" } else { $tag = "v$version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+          $out = "build"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $exe = "src-tauri/target/release/jy-collector.exe"
+          if (-not (Test-Path $exe)) { throw "未找到构建产物：$exe" }
+
+          # 绿色版：exe + sidecar 同级目录；数据写入 %APPDATA%，不写程序目录。
+          $stage = "build/portable/JY-Collector"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $exe "$stage/jy-collector.exe"
+          Copy-Item "src-tauri/sidecar" "$stage/sidecar" -Recurse
+          Copy-Item "docs/WINDOWS.md" "$stage/使用说明.md"
+          Compress-Archive -Path "$stage/*" -DestinationPath "$out/JY-Collector-$version-windows-x64-portable.zip" -Force
+
+          # currentUser 安装包
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "未找到 NSIS 安装包" }
+          Copy-Item $setup.FullName "$out/JY-Collector-$version-windows-x64-setup.exe"
+
+          # 校验值
+          $files = Get-ChildItem $out -File | Sort-Object Name
+          $lines = foreach ($file in $files) {
+            "$((Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower())  $($file.Name)"
+          }
+          Set-Content -Path "$out/SHA256SUMS.txt" -Value $lines -Encoding utf8
+
+          $setupHash = (Get-FileHash "$out/JY-Collector-$version-windows-x64-setup.exe" -Algorithm SHA256).Hash.ToLower()
+          $portableHash = (Get-FileHash "$out/JY-Collector-$version-windows-x64-portable.zip" -Algorithm SHA256).Hash.ToLower()
+
+          $notes = @"
+          # JY Collector $version · Windows x64
+
+          ## 下载哪个
+
+          - **免安装绿色版（推荐先试）**：JY-Collector-$version-windows-x64-portable.zip
+          - **安装包（仅当前用户，无需管理员权限）**：JY-Collector-$version-windows-x64-setup.exe
+          - **校验值**：SHA256SUMS.txt
+
+          ## 启动方式
+
+          - 绿色版：解压到任意可写目录，双击 jy-collector.exe。数据保存在 %APPDATA%\com.jy.collector，不写程序目录。
+          - 安装包：双击运行，按提示安装到当前用户目录，开始菜单会出现 jy-collector。
+
+          ## 被 Windows 拦截时
+
+          1. 右键下载的文件 → 属性 → 勾选“解除锁定” → 确定。
+          2. 双击后若出现“Windows 已保护你的电脑”：点“更多信息” → “仍要运行”。
+          3. 若被公司策略阻止，请联系 IT 放行，或改用绿色版。
+
+          ## 缺少 WebView2
+
+          Win11 自带；Win10 多数随 Edge 预装。若启动提示缺少 WebView2，安装 Microsoft Edge WebView2 Runtime（Evergreen Bootstrapper）后再启动。
+
+          ## Windows 暂不可用的功能
+
+          “从本机微信读取并解密聊天记录”尚未实现，采集页会显示一条状态说明，不会崩溃或白屏。记录、记录表、台账导出、设置等界面可以正常打开；由于暂无数据源，会话与消息列表为空。
+
+          ## 校验下载
+
+          PowerShell：Get-FileHash .\文件名 -Algorithm SHA256，与 SHA256SUMS.txt 对比。
+
+          SHA256：
+
+          - setup.exe：$setupHash
+          - portable.zip：$portableHash
+          "@
+          [System.IO.File]::WriteAllText((Join-Path $out "release-notes.md"), $notes, [System.Text.UTF8Encoding]::new($false))
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-${{ steps.meta.outputs.version }}
+          path: build/*
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: JY Collector ${{ steps.meta.outputs.version }} · Windows x64
+          body_path: build/release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            build/JY-Collector-${{ steps.meta.outputs.version }}-windows-x64-setup.exe
+            build/JY-Collector-${{ steps.meta.outputs.version }}-windows-x64-portable.zip
+            build/SHA256SUMS.txt
