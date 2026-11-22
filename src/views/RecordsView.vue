@@ -3,6 +3,7 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { api } from "../api";
 import MessageDetailModal from "../components/MessageDetailModal.vue";
+import SheetGrid from "../components/SheetGrid.vue";
 import {
   appendSummary,
   ensureTargetPath,
@@ -15,6 +16,7 @@ import type {
   Message,
   RecordItem,
   RecordSource,
+  SheetRowData,
   Template,
 } from "../types";
 import { formatTime } from "../utils";
@@ -60,6 +62,28 @@ const filteredRecords = computed(() => {
     );
   });
 });
+
+const recordHeaders = ["记录", "群组", "字段", "来源", "导出", "更新时间"];
+
+const recordRows = computed<SheetRowData[]>(() =>
+  filteredRecords.value.map((record, index) => ({
+    row: index + 1,
+    cells: [
+      record.title,
+      record.groupName,
+      fieldSummary(record)
+        .map((item) => `${item.label}：${item.value}`)
+        .join(" · "),
+      `${record.sourceCount} 条`,
+      record.exportedAt ? "已导出" : "未导出",
+      formatTime(record.updatedAt),
+    ],
+  })),
+);
+
+function recordFor(row: SheetRowData): RecordItem | undefined {
+  return filteredRecords.value[row.row - 1];
+}
 
 const editSchema = computed(() => {
   if (!editRecord.value) return [];
@@ -336,61 +360,64 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div class="table-wrap">
-        <table class="records">
-          <thead>
-            <tr>
-              <th>记录</th>
-              <th>群组</th>
-              <th>字段</th>
-              <th>来源</th>
-              <th>导出</th>
-              <th>更新时间</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="record in filteredRecords" :key="record.id">
-              <td>
-                <div class="cell-title">{{ record.title }}</div>
-                <div class="cell-sub">创建于 {{ formatTime(record.createdAt) }}</div>
-              </td>
-              <td>{{ record.groupName }}</td>
-              <td>
-                <div class="cell-fields">
-                  <template v-for="(item, index) in fieldSummary(record)" :key="item.label">
-                    <span v-if="index > 0" class="sep">·</span>
-                    {{ item.label }}：{{ item.value }}
-                  </template>
-                </div>
-              </td>
-              <td>
-                <button class="text-btn" @click="openSources(record)">
-                  {{ record.sourceCount }} 条
-                </button>
-              </td>
-              <td>
-                <span class="export-state" :class="{ done: record.exportedAt }">
-                  {{ record.exportedAt ? "已导出" : "未导出" }}
-                </span>
-              </td>
-              <td>{{ formatTime(record.updatedAt) }}</td>
-              <td>
-                <div class="row-actions">
-                  <button class="text-btn" @click="openEdit(record)">编辑</button>
-                  <button class="text-btn" @click="requestDelete(record)">
-                    {{ deleteConfirmId === record.id ? "确认删除" : "删除" }}
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <div v-if="loading" class="table-empty">加载中</div>
-        <div v-else-if="filteredRecords.length === 0" class="table-empty">
-          没有匹配的记录
-        </div>
-      </div>
+      <SheetGrid
+        class="records-grid"
+        :headers="recordHeaders"
+        :rows="recordRows"
+        :sizing-rows="recordRows"
+        :loading="loading"
+        :editable="false"
+        :draggable="false"
+        :resizable="true"
+        :min-width="0"
+        :actions-width="104"
+        width-cache-key="jy-records-widths"
+        empty-text="没有匹配的记录"
+      >
+        <template #cell="{ row, col, value }">
+          <div v-if="recordFor(row)" class="record-cell">
+            <template v-if="col === 0">
+              <div class="cell-title">{{ value }}</div>
+              <div class="cell-sub">
+                创建于 {{ formatTime(recordFor(row)!.createdAt) }}
+              </div>
+            </template>
+            <template v-else-if="col === 2">
+              <div class="cell-fields">
+                <template
+                  v-for="(item, index) in fieldSummary(recordFor(row)!)"
+                  :key="item.label"
+                >
+                  <span v-if="index > 0" class="sep">·</span>
+                  {{ item.label }}：{{ item.value }}
+                </template>
+              </div>
+            </template>
+            <template v-else-if="col === 3">
+              <button class="text-btn" @click="openSources(recordFor(row)!)">
+                {{ recordFor(row)!.sourceCount }} 条
+              </button>
+            </template>
+            <template v-else-if="col === 4">
+              <span
+                class="export-state"
+                :class="{ done: recordFor(row)!.exportedAt }"
+              >
+                {{ recordFor(row)!.exportedAt ? "已导出" : "未导出" }}
+              </span>
+            </template>
+            <template v-else>{{ value }}</template>
+          </div>
+        </template>
+        <template #row-actions="{ row }">
+          <template v-if="recordFor(row)">
+            <button class="text-btn" @click="openEdit(recordFor(row)!)">编辑</button>
+            <button class="text-btn" @click="requestDelete(recordFor(row)!)">
+              {{ deleteConfirmId === recordFor(row)!.id ? "确认删除" : "删除" }}
+            </button>
+          </template>
+        </template>
+      </SheetGrid>
     </div>
 
     <div v-if="editRecord" class="drawer-backdrop" @click.self="closeEdit">

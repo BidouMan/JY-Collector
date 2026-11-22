@@ -1,15 +1,44 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+import { api } from "./api";
+import SetupWizard from "./components/SetupWizard.vue";
+import { notify, toasts } from "./toast";
 import LedgerView from "./views/LedgerView.vue";
 import RecordsView from "./views/RecordsView.vue";
 import SearchView from "./views/SearchView.vue";
 import SettingsView from "./views/SettingsView.vue";
 import WorkbenchView from "./views/WorkbenchView.vue";
-import { toasts } from "./toast";
 
 type View = "collect" | "search" | "records" | "ledger" | "settings";
 
 const view = ref<View>("collect");
+const setupOpen = ref(false);
+const setupMode = ref<"first" | "reauth">("first");
+
+function onOpenSetup(event: Event) {
+  const detail = (event as CustomEvent<{ mode?: "first" | "reauth" }>).detail;
+  setupMode.value = detail?.mode === "reauth" ? "reauth" : "first";
+  setupOpen.value = true;
+}
+
+function onSetupDone() {
+  setupOpen.value = false;
+  notify("设置已完成");
+}
+
+onMounted(async () => {
+  window.addEventListener("jy:open-setup", onOpenSetup);
+  try {
+    if (!(await api.setupCompleted())) {
+      setupMode.value = "first";
+      setupOpen.value = true;
+    }
+  } catch {
+    // 读取标志失败时不打断主界面，用户仍可手动操作。
+  }
+});
+
+onBeforeUnmount(() => window.removeEventListener("jy:open-setup", onOpenSetup));
 </script>
 
 <template>
@@ -45,6 +74,13 @@ const view = ref<View>("collect");
       <LedgerView v-if="view === 'ledger'" />
       <SettingsView v-if="view === 'settings'" />
     </main>
+
+    <SetupWizard
+      v-if="setupOpen"
+      :mode="setupMode"
+      @done="onSetupDone"
+      @close="setupOpen = false"
+    />
 
     <div class="toast-host">
       <div

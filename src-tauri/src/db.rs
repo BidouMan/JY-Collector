@@ -1,8 +1,8 @@
 use crate::models::{
     AvatarDto, AvatarUrlDto, GroupDto, MessageDto, PersonDto, RecordDto, RecordPayload,
     RecordSourceDto, SchemaDto, SchemaInput, SearchItemDto, SearchPageDto, SearchQuery,
-    SettingsDto, TemplateColumn, TemplateDto, TemplateInput, WxAvatarInput, WxAvatarUrlInput,
-    WxGroupInput, WxMessageInput,
+    SettingsDto, TemplateColumn, TemplateDto, TemplateInput,
+    TemplateSheet, WxAvatarInput, WxAvatarUrlInput, WxGroupInput, WxMessageInput,
 };
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -43,12 +43,17 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 
+-- 台账行与录入记录共用一张表：data_json 的 key 就是模板列 key。
+-- group_id 允许为空，手工新增行和 Excel 导入行没有来源群。
 CREATE TABLE IF NOT EXISTS records (
     id TEXT PRIMARY KEY,
-    group_id TEXT NOT NULL REFERENCES chat_groups(id),
+    group_id TEXT REFERENCES chat_groups(id),
     title TEXT NOT NULL,
     data_json TEXT NOT NULL DEFAULT '{}',
     template_id TEXT,
+    sheet_name TEXT NOT NULL DEFAULT '',
+    sort_order REAL NOT NULL DEFAULT 0,
+    origin TEXT NOT NULL DEFAULT 'capture',
     exported_at TEXT,
     export_batch TEXT,
     export_target TEXT,
@@ -65,6 +70,7 @@ CREATE TABLE IF NOT EXISTS templates (
     sheet_name TEXT NOT NULL DEFAULT '',
     header_row INTEGER NOT NULL DEFAULT 1,
     file_name_rule TEXT NOT NULL DEFAULT '',
+    sheets_json TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -72,9 +78,7 @@ CREATE TABLE IF NOT EXISTS templates (
 CREATE TABLE IF NOT EXISTS basket (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     added_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS followed_people (
+);CREATE TABLE IF NOT EXISTS followed_people (
     sender_id TEXT PRIMARY KEY,
     sender_name TEXT NOT NULL,
     created_at TEXT NOT NULL
@@ -183,26 +187,100 @@ fn seed_default_template(conn: &Connection) -> rusqlite::Result<()> {
 
 fn template_from_row(row: &rusqlite::Row) -> rusqlite::Result<TemplateDto> {
     let raw: String = row.get(3)?;
-    let columns: Vec<TemplateColumn> = serde_json::from_str(&raw).unwrap_or_default();
+    let legacy_columns: Vec<TemplateColumn> = serde_json::from_str(&raw).unwrap_or_default();
+    let legacy_sheet: String = row.get(5)?;
+    let legacy_header_row: i64 = row.get(6)?;
+    let raw_sheets: String = row.get(8)?;
+    let mut sheets: Vec<TemplateSheet> = serde_json::from_str(&raw_sheets).unwrap_or_default();
+    if sheets.is_empty() {
+        sheets.push(TemplateSheet {
+            name: legacy_sheet.clone(),
+            header_row: legacy_header_row,
+            columns: legacy_columns.clone(),
+            primary: true,
+        });
+    }
+    let primary = sheets
+        .iter()
+        .find(|sheet| sheet.primary)
+        .or_else(|| sheets.first())
+        .cloned();
+    let (columns, sheet_name, header_row) = match primary {
+        Some(sheet) => (sheet.columns, sheet.name, sheet.header_row),
+        None => (legacy_columns, legacy_sheet, legacy_header_row),
+    };
     Ok(TemplateDto {
         id: row.get(0)?,
         name: row.get(1)?,
         is_default: row.get::<_, i64>(2)? != 0,
         columns,
         target_path: row.get(4)?,
-        sheet_name: row.get(5)?,
-        header_row: row.get(6)?,
+        sheet_name,
+        header_row,
         file_name_rule: row.get(7)?,
+        sheets,
     })
 }
 
 pub fn list_templates(conn: &Connection) -> rusqlite::Result<Vec<TemplateDto>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, is_default, columns_json, target_path, sheet_name, header_row, file_name_rule
+        "SELECT id, name, is_default, columns_json, target_path, sheet_name, header_row, file_name_rule, sheets_json
          FROM templates ORDER BY is_default DESC, created_at ASC",
     )?;
     let rows = stmt.query_map([], template_from_row)?;
     rows.collect()
+}
+
+/// 保证模板至少有一个工作表，并且只有一个 primary。
+fn normalize_template_sheets(input: &TemplateInput) -> Vec<TemplateSheet> {
+    let mut sheets = input.sheets.clone();
+    if sheets.is_empty() {
+        sheets.push(TemplateSheet {
+            name: if input.sheet_name.trim().is_empty() {
+                input.name.trim().to_string()
+            } else {
+                input.sheet_name.trim().to_string()
+            },
+            header_row: if input.header_row < 1 { 1 } else { input.header_row },
+            columns: input.columns.clone(),
+            primary: true,
+        });
+    }
+
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, sheet) in sheets.iter_mut().enumerate() {
+        let base = if sheet.name.trim().is_empty() {
+            format!("Sheet{}", index + 1)
+        } else {
+            sheet.name.trim().to_string()
+        };
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while used.contains(&name) {
+            name = format!("{} {}", base, suffix);
+            suffix += 1;
+        }
+        used.insert(name.clone());
+        sheet.name = name;
+        sheet.header_row = if sheet.header_row < 1 { 1 } else { sheet.header_row };
+    }
+
+    let mut primary_seen = false;
+    for sheet in &mut sheets {
+        if sheet.primary {
+            if primary_seen {
+                sheet.primary = false;
+            } else {
+                primary_seen = true;
+            }
+        }
+    }
+    if !primary_seen {
+        if let Some(first) = sheets.first_mut() {
+            first.primary = true;
+        }
+    }
+    sheets
 }
 
 pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::Result<TemplateDto> {
@@ -216,13 +294,22 @@ pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::
     } else {
         input.name.trim().to_string()
     };
-    let columns = serde_json::to_string(&input.columns).unwrap_or_else(|_| "[]".into());
-    let sheet = if input.sheet_name.trim().is_empty() {
-        name.clone()
-    } else {
-        input.sheet_name.trim().to_string()
-    };
-    let header_row = if input.header_row < 1 { 1 } else { input.header_row };
+    let sheets = normalize_template_sheets(input);
+    let primary = sheets
+        .iter()
+        .find(|sheet| sheet.primary)
+        .or_else(|| sheets.first())
+        .cloned()
+        .unwrap_or(TemplateSheet {
+            name: name.clone(),
+            header_row: 1,
+            columns: Vec::new(),
+            primary: true,
+        });
+    let columns = serde_json::to_string(&primary.columns).unwrap_or_else(|_| "[]".into());
+    let sheet = primary.name.clone();
+    let header_row = primary.header_row;
+    let sheets_json = serde_json::to_string(&sheets).unwrap_or_else(|_| "[]".into());
     let rule = if input.file_name_rule.trim().is_empty() {
         format!("{}-{{date}}.xlsx", name)
     } else {
@@ -238,7 +325,7 @@ pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::
     if exists > 0 {
         tx.execute(
             "UPDATE templates SET name=?1, columns_json=?2, target_path=?3, sheet_name=?4,
-                    header_row=?5, file_name_rule=?6, updated_at=?7 WHERE id=?8",
+                    header_row=?5, file_name_rule=?6, sheets_json=?7, updated_at=?8 WHERE id=?9",
             params![
                 name,
                 columns,
@@ -246,6 +333,7 @@ pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::
                 sheet,
                 header_row,
                 rule,
+                sheets_json,
                 now,
                 id
             ],
@@ -253,8 +341,8 @@ pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::
     } else {
         tx.execute(
             "INSERT INTO templates
-             (id, name, is_default, columns_json, target_path, sheet_name, header_row, file_name_rule, created_at, updated_at)
-             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+             (id, name, is_default, columns_json, target_path, sheet_name, header_row, file_name_rule, sheets_json, created_at, updated_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 id,
                 name,
@@ -263,6 +351,7 @@ pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::
                 sheet,
                 header_row,
                 rule,
+                sheets_json,
                 now
             ],
         )?;
@@ -282,7 +371,7 @@ pub fn save_template(conn: &mut Connection, input: &TemplateInput) -> rusqlite::
 
 pub fn get_template(conn: &Connection, id: &str) -> rusqlite::Result<Option<TemplateDto>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, is_default, columns_json, target_path, sheet_name, header_row, file_name_rule
+        "SELECT id, name, is_default, columns_json, target_path, sheet_name, header_row, file_name_rule, sheets_json
          FROM templates WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![id], template_from_row)?;
@@ -363,7 +452,46 @@ pub fn set_default_template(conn: &Connection, id: &str) -> rusqlite::Result<()>
     Ok(())
 }
 
-fn next_id(prefix: &str) -> String {
+/// 只更新模板的工作表定义，保留目标路径、文件名规则等其它配置。
+pub fn update_template_sheets(
+    conn: &mut Connection,
+    template_id: &str,
+    sheets: &[TemplateSheet],
+) -> rusqlite::Result<()> {
+    update_template_sheets_in(conn, template_id, sheets)
+}
+
+/// 事务内版本：`Transaction` 解引用后可直接传入。
+pub(crate) fn update_template_sheets_in(
+    conn: &Connection,
+    template_id: &str,
+    sheets: &[TemplateSheet],
+) -> rusqlite::Result<()> {
+    let primary = sheets
+        .iter()
+        .find(|sheet| sheet.primary)
+        .or_else(|| sheets.first());
+    let (columns_json, sheet_name, header_row) = match primary {
+        Some(sheet) => (
+            serde_json::to_string(&sheet.columns).unwrap_or_else(|_| "[]".to_string()),
+            sheet.name.clone(),
+            sheet.header_row,
+        ),
+        None => ("[]".to_string(), String::new(), 1),
+    };
+    let sheets_json = serde_json::to_string(sheets).unwrap_or_else(|_| "[]".to_string());
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE templates
+            SET columns_json = ?1, sheet_name = ?2, header_row = ?3,
+                sheets_json = ?4, updated_at = ?5
+          WHERE id = ?6",
+        params![columns_json, sheet_name, header_row, sheets_json, now, template_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn next_id(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let millis = std::time::SystemTime::now()
@@ -437,17 +565,26 @@ JOIN chat_groups g ON g.id = m.group_id
 LEFT JOIN messages q ON q.id = m.quoted_message_id
 "#;
 
+/// 台账结构版本：0 为 Excel 直接编辑时代，1 为 records 兼作台账行。
+const LEDGER_SCHEMA_VERSION: i64 = 1;
+
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
-    migrate(&conn)?;
+    // 重建 records 前留一份完整备份；只在确实需要重建时做，避免每次启动都复制。
+    if needs_records_rebuild(&conn) {
+        let _ = backup_before_ledger_migration(&conn, path);
+    }
+    migrate(&mut conn)?;
     cleanup_legacy_mock(&mut conn)?;
     seed_default_template(&conn)?;
+    // 模板播种之后再补归属，保证旧记录能落到默认模板的主工作表。
+    backfill_record_ownership(&mut conn)?;
     Ok(conn)
 }
 
 /// 旧版本数据库补列（SQLite 的 ADD COLUMN 是 O(1)，不会重写整库）。
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate(conn: &mut Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "chat_groups", "last_active", "TEXT")?;
     ensure_column(conn, "chat_groups", "kind", "TEXT NOT NULL DEFAULT 'group'")?;
     ensure_column(conn, "messages", "quoted_content", "TEXT")?;
@@ -461,6 +598,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "records", "exported_at", "TEXT")?;
     ensure_column(conn, "records", "export_batch", "TEXT")?;
     ensure_column(conn, "records", "export_target", "TEXT")?;
+    ensure_column(conn, "templates", "sheets_json", "TEXT NOT NULL DEFAULT ''")?;
+    migrate_ledger_schema(conn)?;
     // 检索索引属于可选能力：建不出来就保持 LIKE 检索，不阻塞启动。
     if ensure_search_index(conn).is_err() {
         let _ = conn.execute_batch(
@@ -472,6 +611,190 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     Ok(())
 }
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+/// 旧库的 records 表需要重建：group_id 要允许为空，并新增台账行字段。
+/// 重建期间必须关闭外键，否则 DROP TABLE 会级联删掉 record_sources。
+fn needs_records_rebuild(conn: &Connection) -> bool {
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+        .unwrap_or(0);
+    rows > 0 && !column_exists(conn, "records", "sheet_name").unwrap_or(true)
+}
+
+fn backup_before_ledger_migration(conn: &Connection, path: &Path) -> Result<(), String> {
+    let backup = path.with_extension("pre-ledger.db");
+    if backup.exists() {
+        return Ok(());
+    }
+    conn.execute("VACUUM INTO ?1", params![backup.to_string_lossy().to_string()])
+        .map_err(|e| format!("备份数据库失败：{}", e))?;
+    Ok(())
+}
+
+fn migrate_ledger_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= LEDGER_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if !column_exists(conn, "records", "sheet_name")? {
+        conn.pragma_update(None, "foreign_keys", false)?;
+        let outcome = rebuild_records_table(conn);
+        conn.pragma_update(None, "foreign_keys", true)?;
+        outcome?;
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+        if stmt.query([])?.next()?.is_some() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    conn.pragma_update(None, "user_version", LEDGER_SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn rebuild_records_table(conn: &mut Connection) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE records_ledger_new (
+            id TEXT PRIMARY KEY,
+            group_id TEXT REFERENCES chat_groups(id),
+            title TEXT NOT NULL,
+            data_json TEXT NOT NULL DEFAULT '{}',
+            template_id TEXT,
+            sheet_name TEXT NOT NULL DEFAULT '',
+            sort_order REAL NOT NULL DEFAULT 0,
+            origin TEXT NOT NULL DEFAULT 'capture',
+            exported_at TEXT,
+            export_batch TEXT,
+            export_target TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO records_ledger_new
+            (id, group_id, title, data_json, template_id, sheet_name, sort_order, origin,
+             exported_at, export_batch, export_target, created_at, updated_at)
+        SELECT id, group_id, title, data_json, template_id, '', 0, 'capture',
+               exported_at, export_batch, export_target, created_at, updated_at
+          FROM records;
+        DROP TABLE records;
+        ALTER TABLE records_ledger_new RENAME TO records;
+        CREATE INDEX IF NOT EXISTS idx_records_sheet
+            ON records(template_id, sheet_name, sort_order);
+        "#,
+    )?;
+    tx.commit()
+}
+
+pub(crate) fn primary_sheet_name(template: &TemplateDto) -> String {
+    template
+        .sheets
+        .iter()
+        .find(|sheet| sheet.primary)
+        .or_else(|| template.sheets.first())
+        .map(|sheet| sheet.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| template.sheet_name.clone())
+}
+
+/// 旧记录没有模板归属和工作表归属，启动时补齐一次；已有归属的行不动。
+fn backfill_record_ownership(conn: &mut Connection) -> rusqlite::Result<()> {
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM records
+          WHERE template_id IS NULL OR trim(template_id) = ''
+             OR sheet_name = '' OR sort_order = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    if pending == 0 {
+        return Ok(());
+    }
+
+    let templates = list_templates(conn)?;
+    let Some(default) = templates.first() else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE records SET template_id = ?1
+          WHERE template_id IS NULL OR trim(template_id) = ''",
+        params![default.id],
+    )?;
+
+    let sheets: HashMap<String, String> = templates
+        .iter()
+        .map(|template| (template.id.clone(), primary_sheet_name(template)))
+        .collect();
+    let template_ids: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT template_id FROM records WHERE sheet_name = ''")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    for template_id in template_ids {
+        let sheet = sheets.get(&template_id).cloned().unwrap_or_default();
+        conn.execute(
+            "UPDATE records SET sheet_name = ?1 WHERE template_id = ?2 AND sheet_name = ''",
+            params![sheet, template_id],
+        )?;
+    }
+
+    // 旧行 sort_order 全是 0，按创建顺序在每个工作表内续排在已有行之后。
+    let mut counters: HashMap<String, f64> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT template_id, sheet_name, COALESCE(MAX(sort_order), 0)
+               FROM records GROUP BY template_id, sheet_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (template_id, sheet, max) = row?;
+            counters.insert(format!("{}\u{1f}{}", template_id, sheet), max);
+        }
+    }
+    let pending_rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, template_id, sheet_name FROM records WHERE sort_order = 0
+              ORDER BY template_id ASC, sheet_name ASC, created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let tx = conn.transaction()?;
+    for (id, template_id, sheet_name) in pending_rows {
+        let counter = counters
+            .entry(format!("{}\u{1f}{}", template_id, sheet_name))
+            .or_insert(0.0);
+        *counter += 1.0;
+        tx.execute(
+            "UPDATE records SET sort_order = ?1 WHERE id = ?2",
+            params![*counter, id],
+        )?;
+    }
+    tx.commit()
+}
+
+
 
 /// 全文检索索引：FTS5 trigram 支持中文/英文的任意子串匹配，和原来的
 /// `LIKE '%关键词%'` 语义一致，但不需要全表扫描；关键词少于 3 个字符时
@@ -1379,10 +1702,11 @@ pub fn list_records(conn: &Connection) -> rusqlite::Result<Vec<RecordDto>> {
     let sql = r#"
         SELECT r.id, r.group_id, g.name, r.title, r.data_json,
                (SELECT COUNT(*) FROM record_sources s WHERE s.record_id = r.id),
-               r.template_id, r.exported_at, r.export_batch, r.export_target,
+               r.template_id, r.sheet_name, r.sort_order, r.origin,
+               r.exported_at, r.export_batch, r.export_target,
                r.created_at, r.updated_at
         FROM records r
-        JOIN chat_groups g ON g.id = r.group_id
+        LEFT JOIN chat_groups g ON g.id = r.group_id
         ORDER BY r.updated_at DESC, r.id DESC
     "#;
     let mut stmt = conn.prepare(sql)?;
@@ -1393,19 +1717,47 @@ pub fn list_records(conn: &Connection) -> rusqlite::Result<Vec<RecordDto>> {
         Ok(RecordDto {
             id: row.get(0)?,
             group_id: row.get(1)?,
-            group_name: row.get(2)?,
+            group_name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
             title: row.get(3)?,
             data,
             source_count: row.get(5)?,
             template_id: row.get(6)?,
-            exported_at: row.get(7)?,
-            export_batch: row.get(8)?,
-            export_target: row.get(9)?,
-            created_at: row.get(10)?,
-            updated_at: row.get(11)?,
+            sheet_name: row.get(7)?,
+            sort_order: row.get(8)?,
+            origin: row.get(9)?,
+            exported_at: row.get(10)?,
+            export_batch: row.get(11)?,
+            export_target: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
         })
     })?;
     rows.collect()
+}
+
+/// 决定新记录落在哪个模板的哪个工作表，并排到该表末尾。
+fn resolve_record_placement(
+    conn: &Connection,
+    template_id: Option<&str>,
+) -> rusqlite::Result<(Option<String>, String, f64)> {
+    let template = match template_id {
+        Some(id) if !id.trim().is_empty() => get_template(conn, id)?
+            .or_else(|| list_templates(conn).ok().and_then(|list| list.into_iter().next())),
+        _ => list_templates(conn)
+            .ok()
+            .and_then(|list| list.into_iter().next()),
+    };
+    let Some(template) = template else {
+        return Ok((template_id.map(str::to_string), String::new(), 0.0));
+    };
+    let sheet = primary_sheet_name(&template);
+    let next: f64 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order), 0) FROM records
+          WHERE template_id = ?1 AND sheet_name = ?2",
+        params![template.id, sheet],
+        |row| row.get(0),
+    )?;
+    Ok((Some(template.id), sheet, next + 1.0))
 }
 
 pub fn create_record(conn: &mut Connection, payload: &RecordPayload) -> rusqlite::Result<String> {
@@ -1417,19 +1769,22 @@ pub fn create_record(conn: &mut Connection, payload: &RecordPayload) -> rusqlite
         payload.title.trim().to_string()
     };
     let data_json = serde_json::to_string(&payload.data).unwrap_or_else(|_| "{}".to_string());
+    let (template_id, sheet_name, sort_order) =
+        resolve_record_placement(conn, payload.template_id.as_deref())?;
 
     let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO records
-         (id, group_id, title, data_json, template_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (id, group_id, title, data_json, template_id, sheet_name, sort_order, origin, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'capture', ?8, ?8)",
         params![
             id,
             payload.group_id,
             title,
             data_json,
-            payload.template_id,
-            now,
+            template_id,
+            sheet_name,
+            sort_order,
             now
         ],
     )?;
@@ -1585,6 +1940,57 @@ pub fn save_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Resu
 }
 
 #[cfg(test)]
+pub(crate) fn test_connection() -> Connection {
+    let conn = Connection::open_in_memory().expect("打开测试数据库失败");
+    conn.execute_batch(SCHEMA_SQL).expect("初始化测试表结构失败");
+    conn
+}
+
+/// 测试共用模板：一个工作表、两列（学员/科目）。
+#[cfg(test)]
+pub(crate) fn test_template(conn: &mut Connection) -> TemplateDto {
+    conn.execute(
+        "INSERT INTO chat_groups (id, name) VALUES ('g1', '测试群')",
+        [],
+    )
+    .unwrap();
+    let input = TemplateInput {
+        id: Some("tpl_test".to_string()),
+        name: "测试模板".to_string(),
+        columns: Vec::new(),
+        target_path: String::new(),
+        sheet_name: "台账".to_string(),
+        header_row: 1,
+        file_name_rule: String::new(),
+        is_default: true,
+        sheets: vec![TemplateSheet {
+            name: "台账".to_string(),
+            header_row: 1,
+            columns: vec![
+                TemplateColumn {
+                    key: "student".to_string(),
+                    label: "学员".to_string(),
+                    width: 18,
+                    format: "text".to_string(),
+                    hint: String::new(),
+                    options: Vec::new(),
+                },
+                TemplateColumn {
+                    key: "subject".to_string(),
+                    label: "科目".to_string(),
+                    width: 18,
+                    format: "text".to_string(),
+                    hint: String::new(),
+                    options: Vec::new(),
+                },
+            ],
+            primary: true,
+        }],
+    };
+    save_template(conn, &input).unwrap()
+}
+
+#[cfg(test)]
 mod flow_tests {
     use super::*;
     use crate::models::RecordSourceInput;
@@ -1732,6 +2138,121 @@ mod flow_tests {
 
         drop(conn);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_records_table_is_rebuilt_and_keeps_sources() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "jy-legacy-{}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE chat_groups (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    member_count INTEGER NOT NULL DEFAULT 0,
+                    last_active TEXT,
+                    kind TEXT NOT NULL DEFAULT 'group'
+                );
+                CREATE TABLE records (
+                    id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL REFERENCES chat_groups(id),
+                    title TEXT NOT NULL,
+                    data_json TEXT NOT NULL DEFAULT '{}',
+                    template_id TEXT,
+                    exported_at TEXT,
+                    export_batch TEXT,
+                    export_target TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE record_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    message_id TEXT NOT NULL,
+                    field_key TEXT NOT NULL,
+                    snippet TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE templates (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    columns_json TEXT NOT NULL DEFAULT '[]',
+                    target_path TEXT NOT NULL DEFAULT '',
+                    sheet_name TEXT NOT NULL DEFAULT '',
+                    header_row INTEGER NOT NULL DEFAULT 1,
+                    file_name_rule TEXT NOT NULL DEFAULT '',
+                    sheets_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO chat_groups (id, name) VALUES ('group_old', '老群');
+                INSERT INTO records
+                    (id, group_id, title, data_json, template_id, created_at, updated_at)
+                VALUES ('rec_1', 'group_old', '旧记录', '{"student":"张三"}', 'tpl_x',
+                        '2026-01-01 00:00:00', '2026-01-01 00:00:00');
+                INSERT INTO record_sources (record_id, message_id, field_key, snippet)
+                VALUES ('rec_1', 'msg_1', 'student', '张三');
+                INSERT INTO templates (id, name, is_default, sheet_name, created_at, updated_at)
+                VALUES ('tpl_x', '旧模板', 1, '台账', '2026-01-01 00:00:00', '2026-01-01 00:00:00');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, LEDGER_SCHEMA_VERSION);
+        assert!(column_exists(&conn, "records", "sheet_name").unwrap());
+        assert!(column_exists(&conn, "records", "sort_order").unwrap());
+        assert!(column_exists(&conn, "records", "origin").unwrap());
+
+        let (sheet, template, origin, sort): (String, Option<String>, String, f64) = conn
+            .query_row(
+                "SELECT sheet_name, template_id, origin, sort_order
+                   FROM records WHERE id = 'rec_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(sheet, "台账");
+        assert_eq!(template.as_deref(), Some("tpl_x"));
+        assert_eq!(origin, "capture");
+        assert_eq!(sort, 1.0);
+
+        // 重建后外键仍然有效，记录来源没有被级联删除。
+        let sources: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM record_sources WHERE record_id = 'rec_1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sources, 1);
+
+        // 台账行允许没有来源群。
+        conn.execute(
+            "INSERT INTO records (id, title, created_at, updated_at)
+             VALUES ('rec_2', '手工行', '2026-01-02 00:00:00', '2026-01-02 00:00:00')",
+            [],
+        )
+        .unwrap();
+
+        assert!(path.with_extension("pre-ledger.db").exists());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("pre-ledger.db"));
     }
 
     #[test]

@@ -119,7 +119,12 @@ export interface RecordItem {
   updatedAt: string;
 }
 
-export type ColumnFormat = "text" | "number" | "date";
+export type ColumnFormat =
+  | "text"
+  | "number"
+  | "date"
+  | "select"
+  | "multi_select";
 
 export interface TemplateColumn {
   key: string;
@@ -128,6 +133,17 @@ export interface TemplateColumn {
   format: ColumnFormat;
   /** 该列的填写示例，随列定义一起发给模型。 */
   hint: string;
+  /** 单选/多选列的候选项。 */
+  options?: string[];
+}
+
+/** 模板里的一个工作表。 */
+export interface TemplateSheet {
+  name: string;
+  headerRow: number;
+  columns: TemplateColumn[];
+  /** 录入和导出默认使用的工作表。 */
+  primary: boolean;
 }
 
 export interface Template {
@@ -139,6 +155,8 @@ export interface Template {
   sheetName: string;
   headerRow: number;
   fileNameRule: string;
+  /** 多工作表定义；为空时按 sheetName + columns 的单表结构处理。 */
+  sheets: TemplateSheet[];
 }
 
 export interface AppendReport {
@@ -166,7 +184,41 @@ export interface SheetTable {
   sheet: string;
   headerRow: number;
   headers: string[];
+  /** 与 headers 一一对应的模板列 key，用于视图配置稳定引用列。 */
+  keys: string[];
   rows: SheetRowData[];
+}
+
+/** 表格视图配置：只影响展示，不改动 Excel 数据。 */
+export interface TableViewFilter {
+  key: string;
+  operator: "contains" | "equals" | "empty" | "notEmpty" | "gt" | "lt";
+  value: string;
+}
+
+export interface TableViewSort {
+  key: string;
+  direction: "asc" | "desc";
+}
+
+export interface TableViewGroup {
+  key: string;
+  direction: "asc" | "desc";
+}
+
+export interface TableViewConfig {
+  filters?: TableViewFilter[];
+  /** 多个筛选条件之间的关系：and=全部满足，or=任一满足。 */
+  filterLogic?: "and" | "or";
+  sorts?: TableViewSort[];
+  groupKeys?: TableViewGroup[];
+  hiddenKeys?: string[];
+  /** 冻结第一个可见列。 */
+  freezeFirstColumn?: boolean;
+  /** @deprecated 兼容旧本地缓存 */
+  sort?: TableViewSort | null;
+  /** @deprecated 兼容旧本地缓存 */
+  groupKey?: string;
 }
 
 export interface RecordSource {

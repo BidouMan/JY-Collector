@@ -20,7 +20,7 @@
 //! 密钥安全：只从 macOS 钥匙串或本机凭据文件读取，经子进程 stdin 传递，
 //! 不进入命令行参数、环境变量、前端 IPC 与日志。
 
-use crate::models::{SourceStatusDto, SyncSummaryDto, WxExport};
+use crate::models::{SetupStatusDto, SourceStatusDto, SyncSummaryDto, WxExport};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -86,6 +86,103 @@ pub(crate) fn default_db_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     Path::new(&home)
         .join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
+}
+
+/// 本机微信账号目录（存在 contact.db 才算有效账号），只做目录检查。
+pub fn data_accounts() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(default_db_root()) else {
+        return Vec::new();
+    };
+    let mut accounts = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        if entry.path().join("db_storage/contact/contact.db").is_file() {
+            accounts.push(entry.file_name().to_string_lossy().to_string());
+        }
+    }
+    accounts.sort();
+    accounts
+}
+
+/// 向导与重新授权入口共用的检测：目录、账号、口令是否存在、口令能否解开库。
+/// 只解 contact.db 首页做校验，不读消息库、不写库、不打印密钥。
+pub fn setup_status(sidecar_dir: &Path) -> SetupStatusDto {
+    let mut status = SetupStatusDto {
+        platform: std::env::consts::OS.to_string(),
+        ..Default::default()
+    };
+    if cfg!(target_os = "windows") {
+        status.state = "unsupported".to_string();
+        status.message = "Windows 版暂不支持读取本机微信数据，可以继续完成其他设置".to_string();
+        return status;
+    }
+
+    status.supported = true;
+    let accounts = data_accounts();
+    status.account_count = accounts.len() as i64;
+    status.data_found = !accounts.is_empty();
+    if !status.data_found {
+        status.state = "no_data".to_string();
+        status.message = "还没有找到本机微信聊天记录，请先在本机登录微信".to_string();
+        return status;
+    }
+
+    let key_hex = match load_key_hex() {
+        Ok(key) => {
+            status.key_present = true;
+            key
+        }
+        Err(_) => {
+            status.state = "needs_auth".to_string();
+            status.message = "找到了微信聊天记录，但还没有读取授权".to_string();
+            return status;
+        }
+    };
+
+    let request = serde_json::json!({
+        "probe": "status",
+        "keyHex": key_hex,
+        "dbRoot": default_db_root().to_string_lossy(),
+    });
+    match run_sidecar_json(sidecar_dir, &request) {
+        Ok(value) => {
+            let account = value
+                .get("account")
+                .and_then(|item| item.as_str())
+                .unwrap_or_default();
+            if account.is_empty() {
+                status.state = "needs_auth".to_string();
+                status.message = "读取授权已失效，需要重新授权".to_string();
+            } else {
+                status.authorized = true;
+                status.account = account.to_string();
+                status.state = "ready".to_string();
+                status.message = "已找到微信数据，可以开始同步".to_string();
+            }
+        }
+        Err(_) => {
+            status.state = "error".to_string();
+            status.message = "暂时无法读取微信数据，请确认微信已经登录后重试".to_string();
+        }
+    }
+    status
+}
+
+/// 同步失败是否需要用户重新走向导（口令失效、换账号、数据目录变化等）。
+pub fn is_auth_error(message: &str) -> bool {
+    [
+        "口令",
+        "密钥",
+        "校验失败",
+        "授权",
+        "数据目录",
+        "账号目录",
+        "未找到微信数据",
+    ]
+    .iter()
+    .any(|word| message.contains(word))
 }
 
 /// 主账号下的会话库；账号未知或文件不存在时返回 None。

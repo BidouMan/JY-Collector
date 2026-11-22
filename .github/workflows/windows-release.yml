@@ -140,6 +140,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: JY Collector ${{ steps.meta.outputs.version }} · Windows x64
           body_path: build/release-notes.md
+          prerelease: ${{ contains(steps.meta.outputs.version, '-') }}
           fail_on_unmatched_files: true
           files: |
             build/JY-Collector-${{ steps.meta.outputs.version }}-windows-x64-setup.exe

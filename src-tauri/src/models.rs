@@ -132,12 +132,18 @@ pub struct SchemaDto {
 #[serde(rename_all = "camelCase")]
 pub struct RecordDto {
     pub id: String,
-    pub group_id: String,
+    pub group_id: Option<String>,
     pub group_name: String,
     pub title: String,
     pub data: serde_json::Value,
     pub source_count: i64,
     pub template_id: Option<String>,
+    /// 所属工作表（台账行从这里区分 sheet）。
+    pub sheet_name: String,
+    /// 工作表内的行顺序，拖拽排序只改这个值。
+    pub sort_order: f64,
+    /// capture（采集录入）| manual（手工新增）| import（Excel 导入）
+    pub origin: String,
     pub exported_at: Option<String>,
     pub export_batch: Option<String>,
     pub export_target: Option<String>,
@@ -195,6 +201,23 @@ pub struct TemplateColumn {
     pub format: String,
     #[serde(default)]
     pub hint: String,
+    /// 单选/多选列的候选项。
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+/// 模板里的一个工作表：名称、表头行和列定义。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateSheet {
+    pub name: String,
+    #[serde(default = "default_header_row")]
+    pub header_row: i64,
+    #[serde(default)]
+    pub columns: Vec<TemplateColumn>,
+    /// 录入和导出默认使用的工作表。
+    #[serde(default)]
+    pub primary: bool,
 }
 
 fn default_column_width() -> u32 {
@@ -216,6 +239,8 @@ pub struct TemplateDto {
     pub sheet_name: String,
     pub header_row: i64,
     pub file_name_rule: String,
+    /// 多工作表定义；空表示沿用 sheet_name/header_row/columns 的单表结构。
+    pub sheets: Vec<TemplateSheet>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +260,8 @@ pub struct TemplateInput {
     pub file_name_rule: String,
     #[serde(default)]
     pub is_default: bool,
+    #[serde(default)]
+    pub sheets: Vec<TemplateSheet>,
 }
 
 fn default_header_row() -> i64 {
@@ -255,6 +282,16 @@ pub struct SheetColumnInput {
     pub width: u32,
     #[serde(default = "default_column_format")]
     pub format: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+/// 批量写单元格：`values` 与列一一对应，null 表示保持原值。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetRowUpdate {
+    pub row: u32,
+    pub values: Vec<Option<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +303,44 @@ pub struct AppendReportDto {
     pub path: String,
     pub batch: String,
     pub sheet: String,
+}
+
+/// 单个工作表的对账结果。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerImportSheetDto {
+    pub name: String,
+    pub excel_rows: i64,
+    pub matched: i64,
+    pub excel_only: i64,
+    pub record_only: i64,
+    pub updated: i64,
+}
+
+/// 只读对账预览：先看数字，确认后再落库。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerImportPreviewDto {
+    pub template_id: String,
+    pub workbook: String,
+    pub sheets: Vec<LedgerImportSheetDto>,
+    pub total_excel_rows: i64,
+    pub total_matched: i64,
+    pub total_excel_only: i64,
+    pub total_record_only: i64,
+    pub total_updated: i64,
+    pub columns_added: Vec<String>,
+    pub ignored_sheets: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerImportReportDto {
+    pub preview: LedgerImportPreviewDto,
+    pub inserted: i64,
+    pub updated: i64,
+    pub policy: String,
+    pub backup_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -283,6 +358,34 @@ pub struct SheetRowDto {
     pub cells: Vec<String>,
 }
 
+/// 数据库台账行：id 是稳定身份，row 只用于界面展示。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerRowDto {
+    pub id: String,
+    pub row: u32,
+    pub cells: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerTableDto {
+    pub template_id: String,
+    pub sheet: String,
+    pub header_row: u32,
+    pub headers: Vec<String>,
+    pub keys: Vec<String>,
+    pub rows: Vec<LedgerRowDto>,
+}
+
+/// 批量写行：`values` 与模板列一一对应，null 表示保留原值。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerRowUpdate {
+    pub id: String,
+    pub values: Vec<Option<String>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SheetTableDto {
@@ -290,6 +393,8 @@ pub struct SheetTableDto {
     pub sheet: String,
     pub header_row: u32,
     pub headers: Vec<String>,
+    /// 与 headers 一一对应的模板列 key，用于筛选/排序等视图配置稳定引用列。
+    pub keys: Vec<String>,
     pub rows: Vec<SheetRowDto>,
 }
 
@@ -411,6 +516,25 @@ pub struct SourceStatusDto {
     pub account: String,
     pub last_error: String,
     pub last_synced_at: String,
+    /// 失败原因是口令/密钥问题，界面据此给出“重新授权”入口。
+    pub needs_auth: bool,
+}
+
+/// 首次启动向导与重新授权入口共用的数据源检测结果。
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStatusDto {
+    pub platform: String,
+    pub supported: bool,
+    pub data_found: bool,
+    pub account: String,
+    pub account_count: i64,
+    pub key_present: bool,
+    pub authorized: bool,
+    /// ready / needs_auth / no_data / unsupported / error
+    pub state: String,
+    /// 面向用户的一句话状态说明，不包含错误码。
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]

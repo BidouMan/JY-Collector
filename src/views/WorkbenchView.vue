@@ -46,6 +46,8 @@ const refreshing = ref(false);
 const dataUpdated = ref(false);
 /** 数据源不可用时的说明（例如 Windows 版暂不支持读取本机微信）。 */
 const sourceNotice = ref("");
+/** 口令/密钥失效：给出“重新授权”入口，不弹全屏向导打断采集。 */
+const needsAuth = ref(false);
 let searchTimer: number | undefined;
 let updateTimer: number | undefined;
 
@@ -115,27 +117,6 @@ const filteredMessages = computed(() => {
 });
 
 const basketCount = computed(() => basket.items.length);
-
-/** 连续 5 分钟内同一发送人的消息合并为一段，只显示一次头像和姓名。 */
-const HEADER_GAP_SECONDS = 300;
-
-function messageSeconds(value: string) {
-  const ms = Date.parse(value.replace(" ", "T"));
-  return Number.isNaN(ms) ? 0 : ms / 1000;
-}
-
-const displayMessages = computed(() => {
-  let previous: Message | null = null;
-  return filteredMessages.value.map((message) => {
-    const showHeader =
-      !previous ||
-      previous.senderId !== message.senderId ||
-      Math.abs(messageSeconds(message.createdAt) - messageSeconds(previous.createdAt)) >
-        HEADER_GAP_SECONDS;
-    previous = message;
-    return { message, showHeader };
-  });
-});
 
 const conversationAvatarId = computed(() =>
   mode.value === "person" ? activePerson.value?.senderId ?? "" : activeGroupId.value,
@@ -306,7 +287,7 @@ watch(searchText, (value) => {
   }, 180);
 });
 
-/** 数据有更新未刷新：只 stat 微信消息库，不触发解密；失败时静默。 */
+/** 只 stat 微信消息库，不触发解密；失败时静默。 */
 async function checkUpdated() {
   if (refreshing.value) return;
   try {
@@ -316,11 +297,29 @@ async function checkUpdated() {
   }
 }
 
+/** 同步失败或向导完成后刷新数据源状态，决定是否显示重新授权入口。 */
+async function refreshStatus() {
+  try {
+    const status = await api.sourceStatus();
+    needsAuth.value = status.needsAuth;
+    if (status.ready) sourceNotice.value = "";
+  } catch {
+    needsAuth.value = false;
+  }
+}
+
+function openSetup() {
+  window.dispatchEvent(
+    new CustomEvent("jy:open-setup", { detail: { mode: "reauth" } }),
+  );
+}
+
 async function refresh() {
   if (refreshing.value) return;  refreshing.value = true;
   try {
     const summary = await api.refreshSource();
     sourceNotice.value = "";
+    needsAuth.value = false;
     clearImageCache();
     await loadAvatars(true);
     await loadGroups();
@@ -343,6 +342,7 @@ async function refresh() {
     dataUpdated.value = false;
   } catch (error) {
     notify(String(error), "error");
+    await refreshStatus();
   } finally {
     refreshing.value = false;
   }
@@ -350,6 +350,7 @@ async function refresh() {
 
 /** 设置里改过采集范围后，重新拉取可见的群/成员。 */
 async function onScopeChanged() {
+  await refreshStatus();
   await loadGroups();
   if (mode.value === "person") {
     await loadFollowed();
@@ -375,6 +376,7 @@ onMounted(async () => {
     await Promise.all([refreshBasket(), ensureAvatars()]);
     const [groupList, status] = await Promise.all([collector.listGroups(), api.sourceStatus()]);
     groups.value = groupList;
+    needsAuth.value = status.needsAuth;
     if (!status.ready && status.lastError) {
       // 没有会话时不弹报错，直接在左侧列表显示一条状态说明。
       sourceNotice.value = status.lastError;
@@ -525,6 +527,11 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
+      <div v-if="needsAuth" class="reauth-strip">
+        <span>微信数据不可用，暂时无法同步</span>
+        <button class="text-btn" @click="openSetup">重新连接</button>
+      </div>
+
       <div class="toolbar">
         <div class="grow">
           <input v-model="keyword" class="search-input" placeholder="筛选消息内容或发送人" />
@@ -546,76 +553,69 @@ onBeforeUnmount(() => {
         </div>
         <template v-else>
           <div
-            v-for="entry in displayMessages"
-            :key="entry.message.id"
+            v-for="message in filteredMessages"
+            :key="message.id"
             class="message-item"
-            :class="{ selected: isSelected(entry.message.id), grouped: !entry.showHeader }"
-            @click="toggle(entry.message)"
+            :class="{ selected: isSelected(message.id) }"
+            @click="toggle(message)"
           >
             <input
               class="msg-check"
               type="checkbox"
-              :checked="isSelected(entry.message.id)"
+              :checked="isSelected(message.id)"
               @click.stop
-              @change="toggle(entry.message)"
+              @change="toggle(message)"
             />
-            <span v-if="entry.showHeader" class="msg-avatar">
+            <span class="msg-avatar">
               <img
-                v-if="avatarUrl(entry.message.senderId)"
-                :src="avatarUrl(entry.message.senderId)"
+                v-if="avatarUrl(message.senderId)"
+                :src="avatarUrl(message.senderId)"
                 alt=""
               />
-              <span v-else>{{ avatarInitial(entry.message.senderName) }}</span>
+              <span v-else>{{ avatarInitial(message.senderName) }}</span>
             </span>
-            <span v-else class="msg-avatar spacer"></span>
             <div class="msg-main">
-              <div v-if="entry.showHeader" class="msg-top">
+              <div class="msg-top">
                 <span class="sender">
-                  {{ entry.message.senderName }}
+                  {{ message.senderName }}
                   <span v-if="mode === 'person'" class="group-tag">
-                    {{ entry.message.groupName }}
+                    {{ message.groupName }}
                   </span>
                 </span>
                 <span class="sender-card">
-                  <span v-if="entry.message.type !== 'text'" class="type-badge">
-                    {{ TYPE_LABEL[entry.message.type] }}
+                  <span v-if="message.type !== 'text'" class="type-badge">
+                    {{ TYPE_LABEL[message.type] }}
                   </span>
-                  <span class="msg-time">{{ formatTime(entry.message.createdAt) }}</span>
+                  <span class="msg-time">{{ formatTime(message.createdAt) }}</span>
                 </span>
               </div>
-              <div v-if="entry.message.quotedContent" class="quote-block">
-                引用 {{ entry.message.quotedSender }}：{{
-                  replaceWechatEmoji(entry.message.quotedContent)
+              <div v-if="message.quotedContent" class="quote-block">
+                引用 {{ message.quotedSender }}：{{
+                  replaceWechatEmoji(message.quotedContent)
                 }}
               </div>
               <MessageEmoticon
-                v-if="entry.message.type === 'emoticon' && entry.message.emoticonMd5"
-                :message-id="entry.message.id"
-                :md5="entry.message.emoticonMd5"
+                v-if="message.type === 'emoticon' && message.emoticonMd5"
+                :message-id="message.id"
+                :md5="message.emoticonMd5"
               />
               <MessageImage
-                v-if="entry.message.type === 'image' && entry.message.imageMd5"
-                :md5="entry.message.imageMd5"
+                v-if="message.type === 'image' && message.imageMd5"
+                :md5="message.imageMd5"
                 @preview="previewMd5 = $event"
               />
-              <div v-else-if="entry.message.type === 'image'" class="image-chip">
-                图片 · {{ entry.message.fileName }}
+              <div v-else-if="message.type === 'image'" class="image-chip">
+                图片 · {{ message.fileName }}
               </div>
-              <div v-else-if="entry.message.type === 'file'" class="file-chip">
-                文件 · {{ entry.message.fileName }}
-                <span class="size">{{ entry.message.fileSize }}</span>
+              <div v-else-if="message.type === 'file'" class="file-chip">
+                文件 · {{ message.fileName }}
+                <span class="size">{{ message.fileSize }}</span>
               </div>
               <div
-                v-if="
-                  entry.message.content &&
-                  !(entry.message.type === 'emoticon' && entry.message.emoticonMd5)
-                "
+                v-if="message.content && !(message.type === 'emoticon' && message.emoticonMd5)"
                 class="msg-content"
               >
-                <template
-                  v-for="(part, index) in highlighted(entry.message.content)"
-                  :key="index"
-                >
+                <template v-for="(part, index) in highlighted(message.content)" :key="index">
                   <mark v-if="part.mark">{{ part.text }}</mark>
                   <template v-else>{{ part.text }}</template>
                 </template>

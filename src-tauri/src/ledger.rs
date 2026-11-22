@@ -420,6 +420,57 @@ pub fn create_empty_workbook(path: &Path, sheet_name: &str) -> Result<(), String
     create_workbook(path, sheet_name, &[], &[])
 }
 
+/// 新建包含多个工作表的工作簿，每个工作表写入各自的表头。
+pub fn create_workbook_with_sheets(
+    path: &Path,
+    sheets: &[(String, Vec<String>)],
+) -> Result<(), String> {
+    use rust_xlsxwriter::{Color, Format, FormatAlign, Workbook};
+
+    let mut workbook = Workbook::new();
+    let header_format = Format::new()
+        .set_bold()
+        .set_background_color(Color::RGB(0xEDEDEB))
+        .set_font_color(Color::RGB(0x1A1A1A))
+        .set_align(FormatAlign::Center);
+
+    if sheets.is_empty() {
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("Sheet1").map_err(|e| e.to_string())?;
+    }
+
+    for (index, (name, headers)) in sheets.iter().enumerate() {
+        let sheet = workbook.add_worksheet();
+        let name = if name.trim().is_empty() {
+            format!("Sheet{}", index + 1)
+        } else {
+            name.trim().to_string()
+        };
+        sheet.set_name(&name).map_err(|e| e.to_string())?;
+        for (col, header) in headers.iter().enumerate() {
+            sheet
+                .write_with_format(0, col as u16, header, &header_format)
+                .map_err(|e| e.to_string())?;
+            sheet
+                .set_column_width(col as u16, 18)
+                .map_err(|e| e.to_string())?;
+        }
+        if !headers.is_empty() {
+            sheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("无法创建导出目录：{}", e))?;
+        }
+    }
+    workbook
+        .save(path)
+        .map_err(|e| format!("创建工作簿失败：{}", e))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct SheetInfo {
     pub name: String,
@@ -654,6 +705,57 @@ pub fn update_row(
     write_archive(path, &sheet.part, &updated)
 }
 
+/// 批量修改多行，只写一次压缩包；区域粘贴、撤销重做都走这里。
+pub fn update_rows(
+    path: &Path,
+    sheet_name: &str,
+    updates: &[(u32, Vec<Option<CellValue>>)],
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    check_writable(path)?;
+    let sheet = load_sheet_xml(path, sheet_name)?;
+    let lookup: HashMap<u32, &[Option<CellValue>]> = updates
+        .iter()
+        .map(|(row, values)| (*row, values.as_slice()))
+        .collect();
+    let spans = row_spans(&sheet.xml);
+    let mut found = 0usize;
+    let mut out = String::with_capacity(sheet.xml.len());
+    let mut cursor = 0;
+    for (index, start, end) in &spans {
+        if *start < cursor {
+            continue;
+        }
+        out.push_str(&sheet.xml[cursor..*start]);
+        let block = &sheet.xml[*start..*end];
+        if let Some(values) = lookup.get(index) {
+            if block.contains("<f") {
+                return Err("这一行含有公式，请直接在 Excel 中修改".to_string());
+            }
+            out.push_str(&rebuild_row(block, *index, values)?);
+            found += 1;
+        } else {
+            out.push_str(block);
+        }
+        cursor = *end;
+    }
+    out.push_str(&sheet.xml[cursor..]);
+    if found != lookup.len() {
+        return Err("部分行不存在，请刷新后重试".to_string());
+    }
+
+    let parsed = parse_sheet(&out, &sheet.shared);
+    let (max_row, max_col) = max_row_col(&parsed);
+    let updated = if max_row > 0 && max_col > 0 {
+        update_dimension(&out, max_row, max_col)
+    } else {
+        out
+    };
+    write_archive(path, &sheet.part, &updated)
+}
+
 /// 删除一行并把它下面的行整体上移，保持 Excel 的连续行号。
 pub fn delete_row(path: &Path, sheet_name: &str, row_index: u32) -> Result<(), String> {
     check_writable(path)?;
@@ -685,6 +787,62 @@ pub fn delete_row(path: &Path, sheet_name: &str, row_index: u32) -> Result<(), S
             out.push_str(&renumber_row_block(&sheet.xml[*start..*end], index - 1));
         } else {
             out.push_str(&sheet.xml[*start..*end]);
+        }
+        cursor = *end;
+    }
+    out.push_str(&sheet.xml[cursor..]);
+
+    let parsed = parse_sheet(&out, &sheet.shared);
+    let (max_row, max_col) = max_row_col(&parsed);
+    let updated = if max_row > 0 && max_col > 0 {
+        update_dimension(&out, max_row, max_col)
+    } else {
+        out
+    };
+    write_archive(path, &sheet.part, &updated)
+}
+
+/// 批量删除多行，只写一次压缩包。
+pub fn delete_rows(path: &Path, sheet_name: &str, row_indices: &[u32]) -> Result<(), String> {
+    if row_indices.is_empty() {
+        return Ok(());
+    }
+    check_writable(path)?;
+    let sheet = load_sheet_xml(path, sheet_name)?;
+    if sheet.xml.contains("<f>") || sheet.xml.contains("<f ") {
+        return Err("工作表含有公式，删除行会破坏公式引用，请直接在 Excel 中操作".to_string());
+    }
+    if sheet.xml.contains("<mergeCell") {
+        return Err("工作表含有合并单元格，请直接在 Excel 中删除行".to_string());
+    }
+    let spans = row_spans(&sheet.xml);
+    let mut deleted = row_indices.to_vec();
+    deleted.sort_unstable();
+    deleted.dedup();
+    for row in &deleted {
+        if !spans.iter().any(|(index, _, _)| index == row) {
+            return Err(format!(
+                "工作表「{}」中找不到第 {} 行，请刷新后重试",
+                sheet.name, row
+            ));
+        }
+    }
+
+    let mut out = String::with_capacity(sheet.xml.len());
+    let mut cursor = 0;
+    for (index, start, end) in &spans {
+        if *start < cursor {
+            continue;
+        }
+        out.push_str(&sheet.xml[cursor..*start]);
+        let block = &sheet.xml[*start..*end];
+        if deleted.binary_search(index).is_err() {
+            let shift = deleted.partition_point(|row| row < index) as u32;
+            if shift > 0 {
+                out.push_str(&renumber_row_block(block, index - shift));
+            } else {
+                out.push_str(block);
+            }
         }
         cursor = *end;
     }
@@ -1539,6 +1697,321 @@ fn excel_lock_exists(path: &Path) -> bool {
     path.with_file_name(format!("~${}", name)).exists()
 }
 
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn column_letters(mut column: u32) -> String {
+    let mut letters = Vec::new();
+    while column > 0 {
+        let remainder = ((column - 1) % 26) as u8;
+        letters.push((b'A' + remainder) as char);
+        column = (column - 1) / 26;
+    }
+    letters.iter().rev().collect()
+}
+
+fn next_sheet_id(workbook_xml: &str) -> u32 {
+    let mut max = 0;
+    let mut rest = workbook_xml;
+    while let Some(position) = rest.find("sheetId=\"") {
+        rest = &rest[position + 9..];
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if let Ok(value) = digits.parse::<u32>() {
+            max = max.max(value);
+        }
+    }
+    max + 1
+}
+
+fn next_relationship_id(rels: &HashMap<String, String>) -> u32 {
+    let mut max = 0;
+    for id in rels.keys() {
+        if let Some(number) = id.strip_prefix("rId") {
+            if let Ok(value) = number.parse::<u32>() {
+                max = max.max(value);
+            }
+        }
+    }
+    max + 1
+}
+
+/// 在已有工作簿末尾追加一个工作表，保留其它工作表、样式和公式。
+pub fn append_worksheet(path: &Path, name: &str, headers: &[String]) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("工作表名称不能为空".to_string());
+    }
+    if !path.exists() {
+        return create_workbook(path, name, headers, &[]);
+    }
+    if excel_lock_exists(path) {
+        return Err("目标文件正在 Excel 中打开，请先关闭后再新建工作表".to_string());
+    }
+
+    let (
+        workbook_xml,
+        rels_xml,
+        content_types,
+        rels,
+        existing_names,
+        next_part,
+    ) = {
+        let file = fs::File::open(path).map_err(|e| format!("无法打开目标文件：{}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|_| "目标文件不是有效的 xlsx 工作簿".to_string())?;
+        let workbook_xml =
+            read_entry(&mut archive, "xl/workbook.xml").ok_or("工作簿缺少 xl/workbook.xml")?;
+        let rels_xml =
+            read_entry(&mut archive, "xl/_rels/workbook.xml.rels").ok_or("工作簿缺少关系定义")?;
+        let content_types = read_entry(&mut archive, "[Content_Types].xml")
+            .ok_or("工作簿缺少 [Content_Types].xml")?;
+        let rels = parse_rels(&rels_xml);
+        let existing_names: Vec<String> = parse_sheets(&workbook_xml)
+            .into_iter()
+            .map(|(sheet, _)| sheet)
+            .collect();
+        let mut max_part = 0;
+        for index in 0..archive.len() {
+            let entry = archive
+                .by_index(index)
+                .map_err(|e| format!("读取工作簿条目失败：{}", e))?;
+            let entry_name = entry.name().unwrap_or_default();
+            if let Some(rest) = entry_name.strip_prefix("xl/worksheets/sheet") {
+                if let Some(number) = rest.strip_suffix(".xml") {
+                    if let Ok(value) = number.parse::<u32>() {
+                        max_part = max_part.max(value);
+                    }
+                }
+            }
+        }
+        (workbook_xml, rels_xml, content_types, rels, existing_names, max_part + 1)
+    };
+
+    if existing_names.iter().any(|existing| existing == name) {
+        return Err(format!("工作表「{}」已存在", name));
+    }
+    if !workbook_xml.contains("</sheets>") {
+        return Err("工作簿结构缺少工作表列表".to_string());
+    }
+    if !rels_xml.contains("</Relationships>") {
+        return Err("工作簿关系结构异常".to_string());
+    }
+    if !content_types.contains("</Types>") {
+        return Err("工作簿类型定义结构异常".to_string());
+    }
+
+    let sheet_id = next_sheet_id(&workbook_xml);
+    let rel_id = next_relationship_id(&rels);
+    let sheet_entry = format!(
+        "<sheet name=\"{}\" sheetId=\"{}\" r:id=\"rId{}\"/>",
+        xml_escape(name),
+        sheet_id,
+        rel_id
+    );
+    let new_workbook = workbook_xml.replacen(
+        "</sheets>",
+        &format!("{}</sheets>", sheet_entry),
+        1,
+    );
+    let relationship = format!(
+        "<Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{}.xml\"/>",
+        rel_id, next_part
+    );
+    let new_rels = rels_xml.replacen(
+        "</Relationships>",
+        &format!("{}</Relationships>", relationship),
+        1,
+    );
+    let content_type = format!(
+        "<Override PartName=\"/xl/worksheets/sheet{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>",
+        next_part
+    );
+    let new_content_types = content_types.replacen(
+        "</Types>",
+        &format!("{}</Types>", content_type),
+        1,
+    );
+
+    let mut sheet_xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
+    );
+    sheet_xml.push_str("<sheetData>");
+    if !headers.is_empty() {
+        let mut cells = String::new();
+        for (index, header) in headers.iter().enumerate() {
+            let reference = format!("{}1", column_letters(index as u32 + 1));
+            cells.push_str(&format!(
+                "<c r=\"{}\" t=\"inlineStr\"><is><t xml:space=\"preserve\">{}</t></is></c>",
+                reference,
+                xml_escape(header)
+            ));
+        }
+        sheet_xml.push_str(&format!("<row r=\"1\">{}</row>", cells));
+    }
+    sheet_xml.push_str("</sheetData></worksheet>");
+
+    let mut replacements = HashMap::new();
+    replacements.insert("xl/workbook.xml".to_string(), new_workbook);
+    replacements.insert("xl/_rels/workbook.xml.rels".to_string(), new_rels);
+    replacements.insert("[Content_Types].xml".to_string(), new_content_types);
+    let mut additions = HashMap::new();
+    additions.insert(
+        format!("xl/worksheets/sheet{}.xml", next_part),
+        sheet_xml,
+    );
+    write_archive_with(path, &replacements, &additions)
+}
+
+fn tag_attr(tag: &str, key: &str) -> Option<String> {
+    let pattern = format!("{}=\"", key);
+    let position = tag.find(&pattern)? + pattern.len();
+    let rest = &tag[position..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn set_tag_attr(tag: &str, key: &str, value: &str) -> Option<String> {
+    let pattern = format!("{}=\"", key);
+    let position = tag.find(&pattern)? + pattern.len();
+    let rest = &tag[position..];
+    let end = rest.find('"')?;
+    Some(format!(
+        "{}{}{}",
+        &tag[..position],
+        xml_escape(value),
+        &tag[position + end..]
+    ))
+}
+
+fn replace_sheet_name(xml: &str, old: &str, new: &str) -> Result<String, String> {
+    let mut offset = 0;
+    while let Some(relative) = xml[offset..].find("<sheet") {
+        let start = offset + relative;
+        let Some(tag_end) = xml[start..].find('>') else {
+            break;
+        };
+        let end = start + tag_end + 1;
+        let tag = &xml[start..end];
+        if tag_attr(tag, "name").as_deref() == Some(old) {
+            let updated = set_tag_attr(tag, "name", new)
+                .ok_or_else(|| "工作表名称属性结构异常".to_string())?;
+            return Ok(format!("{}{}{}", &xml[..start], updated, &xml[end..]));
+        }
+        offset = end;
+    }
+    Err(format!("工作簿中没有工作表「{}」", old))
+}
+
+/// 重命名工作簿里的工作表，保留其它工作表和数据。
+pub fn rename_sheet(path: &Path, old: &str, new: &str) -> Result<(), String> {
+    if !path.exists() {
+        return Err("工作簿还没有生成，请先保存配置或录入数据".to_string());
+    }
+    if excel_lock_exists(path) {
+        return Err("目标文件正在 Excel 中打开，请先关闭后再重命名".to_string());
+    }
+    let file = fs::File::open(path).map_err(|e| format!("无法打开目标文件：{}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|_| "目标文件不是有效的 xlsx 工作簿".to_string())?;
+    let workbook_xml =
+        read_entry(&mut archive, "xl/workbook.xml").ok_or("工作簿缺少 xl/workbook.xml")?;
+    let sheets = parse_sheets(&workbook_xml);
+    if !sheets.iter().any(|(name, _)| name == old) {
+        return Err(format!("工作簿中没有工作表「{}」", old));
+    }
+    if sheets
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(new))
+    {
+        return Err(format!("工作表「{}」已存在", new));
+    }
+    drop(archive);
+
+    let updated = replace_sheet_name(&workbook_xml, old, new)?;
+    write_archive(path, "xl/workbook.xml", &updated)
+}
+
+fn write_archive_with(
+    path: &Path,
+    replacements: &HashMap<String, String>,
+    additions: &HashMap<String, String>,
+) -> Result<(), String> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("ledger");
+    let temp = path.with_file_name(format!(".{}.{}.tmp", stem, std::process::id()));
+
+    {
+        let file = fs::File::open(path).map_err(|e| format!("无法打开目标文件：{}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|_| "目标文件不是有效的 xlsx 工作簿".to_string())?;
+        let out = fs::File::create(&temp).map_err(|e| format!("无法写入临时文件：{}", e))?;
+        let mut writer = zip::ZipWriter::new(out);
+
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|e| format!("读取工作簿条目失败：{}", e))?;
+            let name = entry.name().unwrap_or_default().to_string();
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(entry.compression())
+                .unix_permissions(entry.unix_mode().unwrap_or(0o644));
+
+            if entry.is_dir() {
+                writer
+                    .add_directory(name.trim_end_matches('/'), options)
+                    .map_err(|e| format!("写入工作簿失败：{}", e))?;
+                continue;
+            }
+
+            writer
+                .start_file(name.clone(), options)
+                .map_err(|e| format!("写入工作簿失败：{}", e))?;
+            if let Some(new_xml) = replacements.get(&name) {
+                writer
+                    .write_all(new_xml.as_bytes())
+                    .map_err(|e| format!("写入工作簿失败：{}", e))?;
+            } else {
+                let mut buffer = Vec::with_capacity(entry.size() as usize);
+                entry
+                    .read_to_end(&mut buffer)
+                    .map_err(|e| format!("读取工作簿条目失败：{}", e))?;
+                writer
+                    .write_all(&buffer)
+                    .map_err(|e| format!("写入工作簿失败：{}", e))?;
+            }
+        }
+
+        for (name, content) in additions {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(0o644);
+            writer
+                .start_file(name.clone(), options)
+                .map_err(|e| format!("写入工作表失败：{}", e))?;
+            writer
+                .write_all(content.as_bytes())
+                .map_err(|e| format!("写入工作表失败：{}", e))?;
+        }
+
+        writer
+            .finish()
+            .map_err(|e| format!("写入工作簿失败：{}", e))?;
+    }
+
+    fs::rename(&temp, path).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        format!("替换目标文件失败（可能被占用或没有权限）：{}", e)
+    })
+}
+
 fn write_archive(path: &Path, part: &str, new_xml: &str) -> Result<(), String> {
     let stem = path
         .file_stem()
@@ -1914,6 +2387,69 @@ mod tests {
     }
 
     #[test]
+    fn append_worksheet_keeps_existing_sheets() {
+        let path = std::env::temp_dir().join(format!(
+            "jy-ledger-sheets-{}.xlsx",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        create_workbook(
+            &path,
+            "医院",
+            &["名称".to_string()],
+            &[vec![CellValue::Text("A院".into())]],
+        )
+        .unwrap();
+        append_worksheet(&path, "经销商", &["名称".to_string()]).unwrap();
+
+        let sheets = read_workbook(&path).unwrap();
+        let names: Vec<&str> = sheets.iter().map(|sheet| sheet.name.as_str()).collect();
+        assert!(names.contains(&"医院"));
+        assert!(names.contains(&"经销商"));
+
+        let added = read_sheet_table(&path, "经销商", 1).unwrap();
+        assert_eq!(added.headers, vec!["名称"]);
+        let original = read_sheet_table(&path, "医院", 1).unwrap();
+        assert_eq!(original.rows.len(), 1);
+        assert_eq!(original.rows[0].cells, vec!["A院"]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rename_sheet_keeps_data() {
+        let path = std::env::temp_dir().join(format!(
+            "jy-ledger-rename-{}.xlsx",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        create_workbook(
+            &path,
+            "医院",
+            &["名称".to_string()],
+            &[vec![CellValue::Text("A院".into())]],
+        )
+        .unwrap();
+        rename_sheet(&path, "医院", "医院库").unwrap();
+
+        let sheets = read_workbook(&path).unwrap();
+        let names: Vec<&str> = sheets.iter().map(|sheet| sheet.name.as_str()).collect();
+        assert!(names.contains(&"医院库"));
+        assert!(!names.contains(&"医院"));
+
+        let table = read_sheet_table(&path, "医院库", 1).unwrap();
+        assert_eq!(table.headers, vec!["名称"]);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].cells, vec!["A院"]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn read_update_append_and_delete_rows() {
         let path = std::env::temp_dir().join(format!(
             "jy-ledger-table-{}.xlsx",
@@ -2114,6 +2650,60 @@ mod tests {
         assert_eq!(table.headers, vec!["B新", "D", "A"]);
         assert_eq!(table.rows[0].cells, vec!["b1", "", "a1"]);
         assert_eq!(table.rows[1].cells, vec!["b2", "", "a2"]);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_update_and_delete_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "jy-ledger-batch-rows-{}.xlsx",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        append_to_workbook(
+            &path,
+            "数据",
+            1,
+            &["A".to_string(), "B".to_string()],
+            &[
+                vec![
+                    CellValue::Text("a1".into()),
+                    CellValue::Text("b1".into()),
+                ],
+                vec![
+                    CellValue::Text("a2".into()),
+                    CellValue::Text("b2".into()),
+                ],
+                vec![
+                    CellValue::Text("a3".into()),
+                    CellValue::Text("b3".into()),
+                ],
+            ],
+        )
+        .unwrap();
+
+        update_rows(
+            &path,
+            "数据",
+            &[
+                (2, vec![Some(CellValue::Text("A2".into())), None]),
+                (3, vec![None, Some(CellValue::Text("B3".into()))]),
+            ],
+        )
+        .unwrap();
+        let table = read_sheet_table(&path, "数据", 1).unwrap();
+        assert_eq!(table.rows[0].cells, vec!["A2", "b1"]);
+        assert_eq!(table.rows[1].cells, vec!["a2", "B3"]);
+
+        delete_rows(&path, "数据", &[3]).unwrap();
+        let table = read_sheet_table(&path, "数据", 1).unwrap();
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].index, 2);
+        assert_eq!(table.rows[1].index, 3);
+        assert_eq!(table.rows[1].cells, vec!["a3", "b3"]);
 
         let _ = fs::remove_file(&path);
     }

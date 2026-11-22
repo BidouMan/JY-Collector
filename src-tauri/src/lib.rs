@@ -2,16 +2,20 @@ mod db;
 mod export;
 mod extract;
 mod ledger;
+mod ledger_import;
+mod ledger_store;
 mod media;
 mod models;
 mod wechat;
 
 use models::{
     AppendReportDto, AvatarDto, AvatarUrlDto, BootstrapDto, CaptureScopeDto, GroupDto,
-    ImagePayloadDto,
+    ImagePayloadDto, LedgerImportPreviewDto, LedgerImportReportDto, LedgerImportSheetDto,
+    LedgerRowUpdate, LedgerTableDto,
     MessageDto, PersonDto, RecordDto, RecordPayload, RecordSourceDto, SchemaDto, SchemaInput,
-    SearchPageDto, SearchQuery, SettingsDto, SheetColumnInput, SheetInfoDto, SheetRowDto,
-    SheetTableDto, SourceStatusDto, SyncSummaryDto, TemplateColumn, TemplateDto, TemplateInput,
+    SearchPageDto, SearchQuery, SettingsDto, SetupStatusDto, SheetColumnInput, SheetInfoDto,
+    SheetRowDto, SheetRowUpdate, SheetTableDto, SourceStatusDto, SyncSummaryDto,
+    TemplateColumn, TemplateDto, TemplateInput, TemplateSheet,
 };
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -49,6 +53,7 @@ fn record_sync_result(source: &wechat::SourceState, result: &Result<SyncSummaryD
                 status.ready = true;
                 status.account = summary.account.clone();
                 status.last_error = String::new();
+                status.needs_auth = false;
                 status.last_synced_at = chrono::Local::now()
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string();
@@ -58,6 +63,7 @@ fn record_sync_result(source: &wechat::SourceState, result: &Result<SyncSummaryD
         Err(message) => {
             if let Ok(mut status) = source.status.lock() {
                 status.last_error = message.clone();
+                status.needs_auth = wechat::is_auth_error(message);
             }
             None
         }
@@ -397,6 +403,37 @@ fn list_workbooks(dir: String) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+/// 把客户上传的 Excel 复制到应用数据目录，返回副本路径。
+#[tauri::command]
+fn import_workbook(source: String, data_dir: State<DataDirState>) -> Result<String, String> {
+    let src = PathBuf::from(source.trim());
+    if !src.is_file() {
+        return Err("找不到要上传的 Excel 文件".to_string());
+    }
+    let is_xlsx = src
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("xlsx"))
+        .unwrap_or(false);
+    if !is_xlsx {
+        return Err("只支持 .xlsx 文件".to_string());
+    }
+    let dir = data_dir.0.join("templates");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建模板目录：{}", e))?;
+    let stem = src
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("模板");
+    let mut target = dir.join(format!("{}.xlsx", stem));
+    let mut suffix = 2;
+    while target.exists() {
+        target = dir.join(format!("{} ({}).xlsx", stem, suffix));
+        suffix += 1;
+    }
+    std::fs::copy(&src, &target).map_err(|e| format!("复制 Excel 失败：{}", e))?;
+    Ok(target.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn read_workbook(path: String) -> Result<Vec<SheetInfoDto>, String> {
     let mut file = PathBuf::from(path.trim());
@@ -424,9 +461,56 @@ fn resolve_template(
         .ok_or_else(|| "没有可用的导出配置".to_string())
 }
 
-fn column_cell_value(template: &TemplateDto, index: usize, text: &str) -> ledger::CellValue {
-    let is_number = template
-        .columns
+fn resolve_sheet_name(template: &TemplateDto, sheet_name: Option<String>) -> String {
+    sheet_name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            if template.sheet_name.trim().is_empty() {
+                "Sheet1".to_string()
+            } else {
+                template.sheet_name.clone()
+            }
+        })
+}
+
+fn sheet_header_row(template: &TemplateDto, sheet_name: &str) -> u32 {
+    template
+        .sheets
+        .iter()
+        .find(|sheet| sheet.name == sheet_name)
+        .map(|sheet| sheet.header_row)
+        .unwrap_or(template.header_row)
+        .max(1) as u32
+}
+
+pub(crate) fn sheet_columns(template: &TemplateDto, sheet_name: &str) -> Vec<TemplateColumn> {
+    template
+        .sheets
+        .iter()
+        .find(|sheet| sheet.name == sheet_name)
+        .map(|sheet| sheet.columns.clone())
+        .unwrap_or_else(|| template.columns.clone())
+}
+
+/// 让列 key 与表头数量对齐，缺失的列给一个稳定兜底 key。
+fn column_keys(columns: &[TemplateColumn], count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| {
+            columns
+                .get(index)
+                .map(|column| column.key.clone())
+                .unwrap_or_else(|| format!("col_{}", index + 1))
+        })
+        .collect()
+}
+
+fn column_cell_value(
+    columns: &[TemplateColumn],
+    index: usize,
+    text: &str,
+) -> ledger::CellValue {
+    let is_number = columns
         .get(index)
         .map(|column| column.format == "number")
         .unwrap_or(false);
@@ -439,7 +523,7 @@ fn column_cell_value(template: &TemplateDto, index: usize, text: &str) -> ledger
 }
 
 /// 表格列可能比配置多（例如手动导入的表格），先补齐配置列，保证按列号同步时不会错位。
-fn pad_template_columns(columns: &mut Vec<TemplateColumn>, headers: &[String]) {
+pub(crate) fn pad_template_columns(columns: &mut Vec<TemplateColumn>, headers: &[String]) {
     for (index, label) in headers.iter().enumerate() {
         if index >= columns.len() {
             let key = next_column_key(columns, index);
@@ -449,6 +533,7 @@ fn pad_template_columns(columns: &mut Vec<TemplateColumn>, headers: &[String]) {
                 width: 18,
                 format: "text".to_string(),
                 hint: String::new(),
+                options: Vec::new(),
             });
         }
     }
@@ -465,7 +550,7 @@ fn next_column_key(columns: &[TemplateColumn], start: usize) -> String {
     }
 }
 
-fn next_column_key_from(
+pub(crate) fn next_column_key_from(
     used: &std::collections::HashSet<String>,
     start: usize,
 ) -> String {
@@ -479,23 +564,47 @@ fn next_column_key_from(
     }
 }
 
+fn save_sheet_columns_for(
+    conn: &mut rusqlite::Connection,
+    template: &TemplateDto,
+    sheet_name: &str,
+    columns: Vec<TemplateColumn>,
+) -> Result<(), String> {
+    let mut sheets = template.sheets.clone();
+    let index = sheets
+        .iter()
+        .position(|sheet| sheet.name == sheet_name)
+        .ok_or_else(|| format!("模板里没有工作表「{}」", sheet_name))?;
+    sheets[index].columns = columns;
+
+    let primary = sheets
+        .iter()
+        .find(|sheet| sheet.primary)
+        .or_else(|| sheets.first())
+        .cloned()
+        .ok_or_else(|| "模板没有可用的工作表".to_string())?;
+    let input = TemplateInput {
+        id: Some(template.id.clone()),
+        name: template.name.clone(),
+        columns: primary.columns.clone(),
+        target_path: template.target_path.clone(),
+        sheet_name: primary.name.clone(),
+        header_row: primary.header_row,
+        file_name_rule: template.file_name_rule.clone(),
+        is_default: template.is_default,
+        sheets,
+    };
+    db::save_template(conn, &input).map_err(db_err)?;
+    Ok(())
+}
+
 fn save_template_columns(
     conn: &mut rusqlite::Connection,
     template: &TemplateDto,
     columns: Vec<TemplateColumn>,
 ) -> Result<(), String> {
-    let input = TemplateInput {
-        id: Some(template.id.clone()),
-        name: template.name.clone(),
-        columns,
-        target_path: template.target_path.clone(),
-        sheet_name: template.sheet_name.clone(),
-        header_row: template.header_row,
-        file_name_rule: template.file_name_rule.clone(),
-        is_default: template.is_default,
-    };
-    db::save_template(conn, &input).map_err(db_err)?;
-    Ok(())
+    let sheet_name = template.sheet_name.clone();
+    save_sheet_columns_for(conn, template, &sheet_name, columns)
 }
 
 /// 读取最终 Excel 表格的完整内容；文件还没生成时按模板列返回空表。
@@ -521,6 +630,11 @@ fn read_sheet_data(template_id: String, db: State<DbState>) -> Result<SheetTable
                 .iter()
                 .map(|column| column.label.clone())
                 .collect(),
+            keys: template
+                .columns
+                .iter()
+                .map(|column| column.key.clone())
+                .collect(),
             rows: Vec::new(),
         });
     }
@@ -530,6 +644,7 @@ fn read_sheet_data(template_id: String, db: State<DbState>) -> Result<SheetTable
         path: path.to_string_lossy().to_string(),
         sheet: table.name,
         header_row,
+        keys: column_keys(&template.columns, table.headers.len()),
         headers: table.headers,
         rows: table
             .rows
@@ -577,23 +692,33 @@ fn read_sheet_data_named(
     let conn = db.0.lock().map_err(db_err)?;
     let template = resolve_template(&conn, &template_id)?;
     let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
-    let header_row = template.header_row.max(1) as u32;
+    let header_row = template
+        .sheets
+        .iter()
+        .find(|sheet| sheet.name == sheet_name)
+        .map(|sheet| sheet.header_row)
+        .unwrap_or(template.header_row)
+        .max(1) as u32;
 
     if !path.exists() {
+        let columns = sheet_columns(&template, &sheet_name);
         return Ok(SheetTableDto {
             path: path.to_string_lossy().to_string(),
             sheet: sheet_name,
             header_row,
-            headers: Vec::new(),
+            headers: columns.iter().map(|column| column.label.clone()).collect(),
+            keys: columns.iter().map(|column| column.key.clone()).collect(),
             rows: Vec::new(),
         });
     }
 
     let table = ledger::read_sheet_table(&path, &sheet_name, header_row)?;
+    let columns = sheet_columns(&template, &sheet_name);
     Ok(SheetTableDto {
         path: path.to_string_lossy().to_string(),
         sheet: table.name,
         header_row,
+        keys: column_keys(&columns, table.headers.len()),
         headers: table.headers,
         rows: table
             .rows
@@ -610,6 +735,7 @@ fn read_sheet_data_named(
 #[tauri::command]
 fn update_sheet_row(
     template_id: String,
+    sheet_name: Option<String>,
     row: u32,
     values: Vec<Option<String>>,
     db: State<DbState>,
@@ -617,39 +743,96 @@ fn update_sheet_row(
     let conn = db.0.lock().map_err(db_err)?;
     let template = resolve_template(&conn, &template_id)?;
     let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
+    let columns = sheet_columns(&template, &sheet_name);
     let mapped: Vec<Option<ledger::CellValue>> = values
         .iter()
         .enumerate()
         .map(|(index, value)| {
             value
                 .as_deref()
-                .map(|text| column_cell_value(&template, index, text))
+                .map(|text| column_cell_value(&columns, index, text))
         })
         .collect();
-    ledger::update_row(&path, &template.sheet_name, row, &mapped)
+    ledger::update_row(&path, &sheet_name, row, &mapped)
 }
 
+/// 批量写回多行，区域粘贴 / 撤销重做只落一次盘。
 #[tauri::command]
-fn delete_sheet_row(template_id: String, row: u32, db: State<DbState>) -> Result<(), String> {
+fn update_sheet_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    rows: Vec<SheetRowUpdate>,
+    db: State<DbState>,
+) -> Result<(), String> {
     let conn = db.0.lock().map_err(db_err)?;
     let template = resolve_template(&conn, &template_id)?;
     let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
-    ledger::delete_row(&path, &template.sheet_name, row)
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
+    let columns = sheet_columns(&template, &sheet_name);
+    let updates: Vec<(u32, Vec<Option<ledger::CellValue>>)> = rows
+        .iter()
+        .map(|update| {
+            let mapped = update
+                .values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    value
+                        .as_deref()
+                        .map(|text| column_cell_value(&columns, index, text))
+                })
+                .collect();
+            (update.row, mapped)
+        })
+        .collect();
+    ledger::update_rows(&path, &sheet_name, &updates)
 }
 
+/// 批量删除多行，只落一次盘。
 #[tauri::command]
-fn reorder_sheet_rows(
+fn delete_sheet_rows(
     template_id: String,
+    sheet_name: Option<String>,
     rows: Vec<u32>,
     db: State<DbState>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(db_err)?;
     let template = resolve_template(&conn, &template_id)?;
     let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
+    ledger::delete_rows(&path, &sheet_name, &rows)
+}
+
+#[tauri::command]
+fn delete_sheet_row(
+    template_id: String,
+    sheet_name: Option<String>,
+    row: u32,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
+    ledger::delete_row(&path, &sheet_name, row)
+}
+
+#[tauri::command]
+fn reorder_sheet_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    rows: Vec<u32>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
     ledger::reorder_rows(
         &path,
-        &template.sheet_name,
-        template.header_row.max(1) as u32,
+        &sheet_name,
+        sheet_header_row(&template, &sheet_name),
         &rows,
     )
 }
@@ -657,6 +840,7 @@ fn reorder_sheet_rows(
 #[tauri::command]
 fn append_sheet_row(
     template_id: String,
+    sheet_name: Option<String>,
     values: Vec<String>,
     db: State<DbState>,
 ) -> Result<u32, String> {
@@ -668,27 +852,39 @@ fn append_sheet_row(
             std::fs::create_dir_all(parent).map_err(|e| format!("无法创建导出目录：{}", e))?;
         }
     }
-    let headers: Vec<String> = template
-        .columns
-        .iter()
-        .map(|column| column.label.clone())
-        .collect();
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
+    let columns = sheet_columns(&template, &sheet_name);
+    let headers: Vec<String> = columns.iter().map(|column| column.label.clone()).collect();
     if !path.exists() {
-        if headers.is_empty() {
-            ledger::create_empty_workbook(&path, &template.sheet_name)?;
+        let workbook_sheets: Vec<(String, Vec<String>)> = template
+            .sheets
+            .iter()
+            .map(|sheet| {
+                (
+                    sheet.name.clone(),
+                    sheet
+                        .columns
+                        .iter()
+                        .map(|column| column.label.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        if workbook_sheets.is_empty() {
+            ledger::create_workbook_with_sheets(&path, &[(sheet_name.clone(), headers)])?;
         } else {
-            ledger::sync_headers(&path, &template.sheet_name, 1, &headers)?;
+            ledger::create_workbook_with_sheets(&path, &workbook_sheets)?;
         }
     }
     let cells: Vec<ledger::CellValue> = values
         .iter()
         .enumerate()
-        .map(|(index, value)| column_cell_value(&template, index, value))
+        .map(|(index, value)| column_cell_value(&columns, index, value))
         .collect();
     ledger::append_row_aligned(
         &path,
-        &template.sheet_name,
-        template.header_row.max(1) as u32,
+        &sheet_name,
+        sheet_header_row(&template, &sheet_name),
         &cells,
     )
 }
@@ -782,6 +978,7 @@ fn add_sheet_column(
             width: 18,
             format: "text".to_string(),
             hint: String::new(),
+            options: Vec::new(),
         });
         return save_template_columns(&mut conn, &template, columns);
     }
@@ -806,6 +1003,7 @@ fn add_sheet_column(
             width: 18,
             format: "text".to_string(),
             hint: String::new(),
+            options: Vec::new(),
         },
     );
     save_template_columns(&mut conn, &template, columns)
@@ -860,6 +1058,7 @@ fn remove_sheet_column(
 #[tauri::command]
 fn save_sheet_columns(
     template_id: String,
+    sheet_name: Option<String>,
     columns: Vec<SheetColumnInput>,
     db: State<DbState>,
 ) -> Result<(), String> {
@@ -869,17 +1068,15 @@ fn save_sheet_columns(
     let mut conn = db.0.lock().map_err(db_err)?;
     let template = resolve_template(&conn, &template_id)?;
     let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
-    let header_row = template.header_row.max(1) as u32;
+    let sheet_name = resolve_sheet_name(&template, sheet_name);
+    let header_row = sheet_header_row(&template, &sheet_name);
+    let existing_columns = sheet_columns(&template, &sheet_name);
 
-    let mut labels = std::collections::HashSet::new();
     let mut sources = std::collections::HashSet::new();
     for column in &columns {
         let label = column.label.trim();
         if label.is_empty() {
             return Err("列名不能为空".to_string());
-        }
-        if !labels.insert(label.to_string()) {
-            return Err("列名不能重复".to_string());
         }
         if column.source > 0 && !sources.insert(column.source) {
             return Err("列设置有重复，请刷新后重试".to_string());
@@ -891,7 +1088,29 @@ fn save_sheet_columns(
             .iter()
             .map(|column| column.label.trim().to_string())
             .collect();
-        ledger::sync_headers(&path, &template.sheet_name, 1, &headers)?;
+        let mut workbook_sheets: Vec<(String, Vec<String>)> = template
+            .sheets
+            .iter()
+            .map(|sheet| {
+                (
+                    sheet.name.clone(),
+                    sheet
+                        .columns
+                        .iter()
+                        .map(|column| column.label.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        if let Some(target) = workbook_sheets
+            .iter_mut()
+            .find(|(name, _)| name == &sheet_name)
+        {
+            target.1 = headers;
+        } else {
+            workbook_sheets.push((sheet_name.clone(), headers));
+        }
+        ledger::create_workbook_with_sheets(&path, &workbook_sheets)?;
     } else {
         let specs: Vec<ledger::ColumnSpec> = columns
             .iter()
@@ -901,19 +1120,17 @@ fn save_sheet_columns(
                 width: column.width,
             })
             .collect();
-        ledger::save_columns(&path, &template.sheet_name, header_row, &specs)?;
+        ledger::save_columns(&path, &sheet_name, header_row, &specs)?;
     }
 
-    let mut used: std::collections::HashSet<String> = template
-        .columns
+    let mut used: std::collections::HashSet<String> = existing_columns
         .iter()
         .map(|column| column.key.clone())
         .collect();
     let mut next_columns: Vec<TemplateColumn> = Vec::with_capacity(columns.len());
     for (index, column) in columns.iter().enumerate() {
         let key = if column.source > 0 {
-            template
-                .columns
+            existing_columns
                 .get((column.source - 1) as usize)
                 .map(|item| item.key.clone())
                 .filter(|key| !key.is_empty())
@@ -925,6 +1142,8 @@ fn save_sheet_columns(
         let format = match column.format.as_str() {
             "number" => "number",
             "date" => "date",
+            "select" => "select",
+            "multi_select" | "multiSelect" => "multi_select",
             _ => "text",
         };
         next_columns.push(TemplateColumn {
@@ -933,34 +1152,232 @@ fn save_sheet_columns(
             width: column.width.clamp(6, 80),
             format: format.to_string(),
             hint: column.hint.trim().to_string(),
+            options: column
+                .options
+                .iter()
+                .map(|option| option.trim().to_string())
+                .filter(|option| !option.is_empty())
+                .collect(),
         });
     }
-    save_template_columns(&mut conn, &template, next_columns)
+    save_sheet_columns_for(&mut conn, &template, &sheet_name, next_columns)
 }
 
 #[tauri::command]
 fn save_template(input: TemplateInput, db: State<DbState>) -> Result<TemplateDto, String> {
     let mut conn = db.0.lock().map_err(db_err)?;
     let saved = db::save_template(&mut conn, &input).map_err(db_err)?;
-    if !saved.columns.is_empty() {
-        if let Some(path) = resolve_export_path(&saved) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let headers: Vec<String> = saved
-                .columns
-                .iter()
-                .map(|column| column.label.clone())
-                .collect();
-            ledger::sync_headers(
-                &path,
-                &saved.sheet_name,
-                saved.header_row.max(1) as u32,
-                &headers,
-            )?;
+    let Some(path) = resolve_export_path(&saved) else {
+        return Ok(saved);
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let sheets: Vec<(String, Vec<String>)> = saved
+        .sheets
+        .iter()
+        .map(|sheet| {
+            (
+                sheet.name.clone(),
+                sheet
+                    .columns
+                    .iter()
+                    .map(|column| column.label.clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    if !sheets.iter().any(|(_, headers)| !headers.is_empty()) {
+        return Ok(saved);
+    }
+
+    if !path.exists() {
+        ledger::create_workbook_with_sheets(&path, &sheets)?;
+        return Ok(saved);
+    }
+
+    // 工作簿已存在：主表必须同步成功，其余工作表尽力而为。
+    for sheet in &saved.sheets {
+        if sheet.columns.is_empty() {
+            continue;
+        }
+        let headers: Vec<String> = sheet
+            .columns
+            .iter()
+            .map(|column| column.label.clone())
+            .collect();
+        let result = ledger::sync_headers(
+            &path,
+            &sheet.name,
+            sheet.header_row.max(1) as u32,
+            &headers,
+        );
+        if sheet.primary {
+            result?;
         }
     }
     Ok(saved)
+}
+
+/// 在模板工作簿末尾新建一个工作表，并同步到模板定义。
+#[tauri::command]
+fn add_template_sheet(template_id: String, db: State<DbState>) -> Result<String, String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let path = resolve_export_path(&template).ok_or("请先在设置里选择目标目录")?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut used: std::collections::HashSet<String> = template
+        .sheets
+        .iter()
+        .map(|sheet| sheet.name.clone())
+        .collect();
+    if path.exists() {
+        for sheet in ledger::read_workbook(&path)? {
+            used.insert(sheet.name);
+        }
+    }
+    let mut counter = used.len() + 1;
+    let mut name = format!("Sheet{}", counter);
+    while used.contains(&name) {
+        counter += 1;
+        name = format!("Sheet{}", counter);
+    }
+
+    let headers = vec!["名称".to_string()];
+    if path.exists() {
+        ledger::append_worksheet(&path, &name, &headers)?;
+    } else {
+        let mut workbook_sheets: Vec<(String, Vec<String>)> = template
+            .sheets
+            .iter()
+            .map(|sheet| {
+                (
+                    sheet.name.clone(),
+                    sheet
+                        .columns
+                        .iter()
+                        .map(|column| column.label.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        workbook_sheets.push((name.clone(), headers));
+        ledger::create_workbook_with_sheets(&path, &workbook_sheets)?;
+    }
+
+    let mut sheets = template.sheets.clone();
+    sheets.push(TemplateSheet {
+        name: name.clone(),
+        header_row: 1,
+        columns: vec![TemplateColumn {
+            key: "col_1".to_string(),
+            label: "名称".to_string(),
+            width: 24,
+            format: "text".to_string(),
+            hint: String::new(),
+            options: Vec::new(),
+        }],
+        primary: false,
+    });
+    let input = TemplateInput {
+        id: Some(template.id.clone()),
+        name: template.name.clone(),
+        columns: template.columns.clone(),
+        target_path: template.target_path.clone(),
+        sheet_name: template.sheet_name.clone(),
+        header_row: template.header_row,
+        file_name_rule: template.file_name_rule.clone(),
+        is_default: template.is_default,
+        sheets,
+    };
+    db::save_template(&mut conn, &input).map_err(db_err)?;
+    Ok(name)
+}
+
+pub(crate) fn validate_sheet_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("工作表名称不能为空".to_string());
+    }
+    if name.chars().count() > 31 {
+        return Err("工作表名称不能超过 31 个字符".to_string());
+    }
+    if name.chars().any(|ch| "\\/:*?[]".contains(ch)) {
+        return Err("工作表名称不能包含 \\ / : * ? [ ]".to_string());
+    }
+    if name.starts_with('\'') || name.ends_with('\'') {
+        return Err("工作表名称不能以单引号开头或结尾".to_string());
+    }
+    if name.eq_ignore_ascii_case("history") {
+        return Err("History 是保留名称，请换一个".to_string());
+    }
+    Ok(())
+}
+
+/// 重命名工作表，并同步模板定义。
+#[tauri::command]
+fn rename_template_sheet(
+    template_id: String,
+    sheet_name: String,
+    new_name: String,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let name = new_name.trim().to_string();
+    validate_sheet_name(&name)?;
+    if name == sheet_name {
+        return Ok(());
+    }
+
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    if !template.sheets.iter().any(|sheet| sheet.name == sheet_name) {
+        return Err(format!("模板里没有工作表「{}」", sheet_name));
+    }
+    if template
+        .sheets
+        .iter()
+        .any(|sheet| sheet.name != sheet_name && sheet.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(format!("工作表「{}」已存在", name));
+    }
+
+    if let Some(path) = resolve_export_path(&template) {
+        if path.exists() {
+            ledger::rename_sheet(&path, &sheet_name, &name)?;
+        }
+    }
+
+    let mut sheets = template.sheets.clone();
+    if let Some(target) = sheets.iter_mut().find(|sheet| sheet.name == sheet_name) {
+        target.name = name.clone();
+    }
+    let primary = sheets
+        .iter()
+        .find(|sheet| sheet.primary)
+        .or_else(|| sheets.first())
+        .cloned()
+        .unwrap_or(TemplateSheet {
+            name: template.sheet_name.clone(),
+            header_row: template.header_row,
+            columns: template.columns.clone(),
+            primary: true,
+        });
+    let input = TemplateInput {
+        id: Some(template.id.clone()),
+        name: template.name.clone(),
+        columns: primary.columns.clone(),
+        target_path: template.target_path.clone(),
+        sheet_name: primary.name.clone(),
+        header_row: primary.header_row,
+        file_name_rule: template.file_name_rule.clone(),
+        is_default: template.is_default,
+        sheets,
+    };
+    db::save_template(&mut conn, &input).map_err(db_err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1115,7 +1532,289 @@ fn append_ledger(
     })
 }
 
+/// 导入台账时优先用显式路径，其次用模板里配置的台账文件。
+fn import_workbook_path(template: &TemplateDto, path: Option<String>) -> Result<PathBuf, String> {
+    if let Some(raw) = path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let picked = PathBuf::from(raw);
+        if picked.is_dir() {
+            return Err("请选择 .xlsx 台账文件".to_string());
+        }
+        return Ok(picked);
+    }
+    resolve_export_path(template).ok_or_else(|| "请先在导出设置里选择台账文件".to_string())
+}
+
+fn ledger_import_preview_dto(
+    plan: &ledger_import::ImportPlan,
+    template_id: &str,
+) -> LedgerImportPreviewDto {
+    let (total_excel_rows, total_matched, total_excel_only, total_record_only, total_updated) =
+        plan.totals();
+    LedgerImportPreviewDto {
+        template_id: template_id.to_string(),
+        workbook: plan.workbook.clone(),
+        sheets: plan
+            .sheets
+            .iter()
+            .map(|sheet| LedgerImportSheetDto {
+                name: sheet.counts.name.clone(),
+                excel_rows: sheet.counts.excel_rows,
+                matched: sheet.counts.matched,
+                excel_only: sheet.counts.excel_only,
+                record_only: sheet.counts.record_only,
+                updated: sheet.counts.updated,
+            })
+            .collect(),
+        total_excel_rows,
+        total_matched,
+        total_excel_only,
+        total_record_only,
+        total_updated,
+        columns_added: plan.columns_added(),
+        ignored_sheets: plan.ignored_sheets.clone(),
+    }
+}
+
+fn ledger_import_backup_path(data_dir: &std::path::Path) -> PathBuf {
+    let dir = data_dir.join("backups");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("jy-collector.pre-ledger-import.db")
+}
+
+/// 只读对账：返回每个工作表的 Excel 行数、可匹配行数、仅在 Excel / 仅在记录的行数。
 #[tauri::command]
+fn ledger_import_preview(
+    template_id: String,
+    path: Option<String>,
+    db: State<DbState>,
+) -> Result<LedgerImportPreviewDto, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let workbook = import_workbook_path(&template, path)?;
+    let plan = ledger_import::build_plan(&conn, &template, &workbook)?;
+    Ok(ledger_import_preview_dto(&plan, &template.id))
+}
+
+/// 落库导入：先备份数据库，再按 policy 覆盖或保留记录值。
+#[tauri::command]
+fn ledger_import_apply(
+    template_id: String,
+    path: Option<String>,
+    policy: Option<String>,
+    db: State<DbState>,
+    data_dir: State<DataDirState>,
+) -> Result<LedgerImportReportDto, String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let workbook = import_workbook_path(&template, path)?;
+    let backup = ledger_import_backup_path(&data_dir.0);
+    if !backup.exists() {
+        conn.execute(
+            "VACUUM INTO ?1",
+            rusqlite::params![backup.to_string_lossy().to_string()],
+        )
+        .map_err(|error| format!("备份数据库失败：{}", error))?;
+    }
+    let policy = match policy.as_deref() {
+        Some("record") => "record",
+        _ => "excel",
+    };
+    let (plan, outcome) = ledger_import::apply(&mut conn, &template, &workbook, policy)?;
+    Ok(LedgerImportReportDto {
+        preview: ledger_import_preview_dto(&plan, &template.id),
+        inserted: outcome.inserted,
+        updated: outcome.updated,
+        policy: policy.to_string(),
+        backup_path: backup.to_string_lossy().to_string(),
+    })
+}
+
+/// 回滚上一次导入：把 records / record_sources / templates 还原到导入前。
+/// 还原前会再备份一次当前数据库，误操作也能退回来。
+#[tauri::command]
+fn ledger_import_restore(
+    db: State<DbState>,
+    data_dir: State<DataDirState>,
+) -> Result<i64, String> {
+    let backup = ledger_import_backup_path(&data_dir.0);
+    if !backup.exists() {
+        return Err("没有可回滚的导入备份".to_string());
+    }
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+    let safety = data_dir
+        .0
+        .join("backups")
+        .join(format!("jy-collector.before-restore-{}.db", stamp));
+    conn.execute(
+        "VACUUM INTO ?1",
+        rusqlite::params![safety.to_string_lossy().to_string()],
+    )
+    .map_err(|error| format!("备份当前数据失败：{}", error))?;
+
+    conn.execute(
+        "ATTACH DATABASE ?1 AS bak",
+        rusqlite::params![backup.to_string_lossy().to_string()],
+    )
+    .map_err(|error| format!("无法打开备份：{}", error))?;
+
+    let outcome = (|| -> Result<i64, String> {
+        let live_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        let backup_version: i64 = conn
+            .query_row("PRAGMA bak.user_version", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if live_version != backup_version {
+            return Err("备份与当前数据结构版本不一致，不能自动回滚".to_string());
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch(
+            "DELETE FROM record_sources;
+             DELETE FROM records;
+             DELETE FROM templates;
+             INSERT INTO templates SELECT * FROM bak.templates;
+             INSERT INTO records SELECT * FROM bak.records;
+             INSERT INTO record_sources SELECT * FROM bak.record_sources;",
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        conn.query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .map_err(|e| e.to_string())
+    })();
+
+    let _ = conn.execute("DETACH DATABASE bak", []);
+    outcome
+}
+
+/// 读取数据库台账；返回稳定行 id，前端后续写入都用 id。
+#[tauri::command]
+fn read_ledger_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    db: State<DbState>,
+) -> Result<LedgerTableDto, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    ledger_store::read_rows(&conn, &template, sheet_name.as_deref())
+}
+
+/// 工作表列表与行数，全部来自数据库，不再打开 Excel。
+#[tauri::command]
+fn read_ledger_sheets(
+    template_id: String,
+    db: State<DbState>,
+) -> Result<Vec<SheetInfoDto>, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    ledger_store::list_sheets(&conn, &template)
+}
+
+#[tauri::command]
+fn update_ledger_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    rows: Vec<LedgerRowUpdate>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let sheet = ledger_store::resolve_sheet(&template, sheet_name.as_deref())?;
+    ledger_store::update_rows(&mut conn, &template, &sheet, &rows)
+}
+
+#[tauri::command]
+fn delete_ledger_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    ids: Vec<String>,
+    db: State<DbState>,
+) -> Result<usize, String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let sheet = ledger_store::resolve_sheet(&template, sheet_name.as_deref())?;
+    ledger_store::delete_rows(&mut conn, &template, &sheet, &ids)
+}
+
+#[tauri::command]
+fn append_ledger_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    rows: Vec<Vec<String>>,
+    db: State<DbState>,
+) -> Result<Vec<String>, String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let sheet = ledger_store::resolve_sheet(&template, sheet_name.as_deref())?;
+    ledger_store::append_rows(&mut conn, &template, &sheet, &rows)
+}
+
+#[tauri::command]
+fn reorder_ledger_rows(
+    template_id: String,
+    sheet_name: Option<String>,
+    ids: Vec<String>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let sheet = ledger_store::resolve_sheet(&template, sheet_name.as_deref())?;
+    ledger_store::reorder_rows(&mut conn, &template, &sheet, &ids)
+}
+
+#[tauri::command]
+fn save_ledger_columns(
+    template_id: String,
+    sheet_name: Option<String>,
+    columns: Vec<SheetColumnInput>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    let sheet = ledger_store::resolve_sheet(&template, sheet_name.as_deref())?;
+    ledger_store::save_columns(&mut conn, &template, &sheet, &columns)
+}
+
+#[tauri::command]
+fn add_ledger_sheet(
+    template_id: String,
+    name: Option<String>,
+    db: State<DbState>,
+) -> Result<String, String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    ledger_store::add_sheet(&mut conn, &template, name)
+}
+
+#[tauri::command]
+fn rename_ledger_sheet(
+    template_id: String,
+    old_name: String,
+    new_name: String,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    ledger_store::rename_sheet(&mut conn, &template, &old_name, &new_name)
+}
+
+#[tauri::command]
+fn delete_ledger_sheet(
+    template_id: String,
+    name: String,
+    force: Option<bool>,
+    db: State<DbState>,
+) -> Result<usize, String> {
+    let mut conn = db.0.lock().map_err(db_err)?;
+    let template = resolve_template(&conn, &template_id)?;
+    ledger_store::delete_sheet(&mut conn, &template, &name, force.unwrap_or(false))
+}
+
+/// 放到工作线程执行，避免全量解密期间界面卡住、进度不动。
+#[tauri::command(async)]
 fn refresh_source(
     db: State<DbState>,
     source: State<wechat::SourceState>,
@@ -1131,6 +1830,36 @@ fn refresh_source(
 fn source_status(source: State<wechat::SourceState>) -> Result<SourceStatusDto, String> {
     let status = source.status.lock().map_err(db_err)?;
     Ok(status.clone())
+}
+
+/// 首次启动向导 / 重新授权：检测微信目录、口令与口令有效性。
+/// 每次都重新读钥匙串，所以“已有口令”会直接返回 ready。
+#[tauri::command]
+async fn wechat_setup_status(
+    source: State<'_, wechat::SourceState>,
+) -> Result<SetupStatusDto, String> {
+    let dir = source.sidecar_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || wechat::setup_status(&dir))
+        .await
+        .map_err(|_| "检测失败，请重试".to_string())
+}
+
+const SETUP_COMPLETED_KEY: &str = "setup_completed";
+
+#[tauri::command]
+fn setup_completed(db: State<DbState>) -> Result<bool, String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    Ok(db::setting_value(&conn, SETUP_COMPLETED_KEY)
+        .map_err(db_err)?
+        .as_deref()
+        == Some("1"))
+}
+
+/// 向导走完后写一次性标志；之后启动直接进主界面。
+#[tauri::command]
+fn complete_setup(db: State<DbState>) -> Result<(), String> {
+    let conn = db.0.lock().map_err(db_err)?;
+    db::save_setting(&conn, SETUP_COMPLETED_KEY, "1").map_err(db_err)
 }
 
 /// 数据有更新未刷新：文件未变动时只做 stat；
@@ -1240,7 +1969,11 @@ pub fn run() {
             app.manage(DataDirState(data_dir));
             app.manage(source);
             if let Some(window) = app.get_webview_window("main") {
+                // macOS 用自绘顶栏，清除原生标题；Windows 保留窗口标题，避免任务栏显示空白。
+                #[cfg(target_os = "macos")]
                 let _ = window.set_title("");
+                #[cfg(not(target_os = "macos"))]
+                let _ = window.set_title("JY Collector");
             }
             Ok(())
         })
@@ -1276,12 +2009,15 @@ pub fn run() {
             export_records,
             list_templates,
             list_workbooks,
+            import_workbook,
             read_workbook,
             read_template_sheets,
             read_sheet_data,
             read_sheet_data_named,
             update_sheet_row,
+            update_sheet_rows,
             delete_sheet_row,
+            delete_sheet_rows,
             reorder_sheet_rows,
             append_sheet_row,
             rename_sheet_column,
@@ -1289,6 +2025,8 @@ pub fn run() {
             remove_sheet_column,
             save_sheet_columns,
             save_template,
+            add_template_sheet,
+            rename_template_sheet,
             delete_template,
             set_default_template,
             list_basket,
@@ -1296,11 +2034,27 @@ pub fn run() {
             remove_from_basket,
             clear_basket,
             append_ledger,
+            ledger_import_preview,
+            ledger_import_apply,
+            ledger_import_restore,
+            read_ledger_rows,
+            read_ledger_sheets,
+            update_ledger_rows,
+            delete_ledger_rows,
+            append_ledger_rows,
+            reorder_ledger_rows,
+            save_ledger_columns,
+            add_ledger_sheet,
+            rename_ledger_sheet,
+            delete_ledger_sheet,
             get_data_dir,
             open_data_dir,
             refresh_source,
             source_status,
-            source_updated
+            source_updated,
+            wechat_setup_status,
+            setup_completed,
+            complete_setup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

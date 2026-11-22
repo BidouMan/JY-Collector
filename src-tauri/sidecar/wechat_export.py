@@ -664,6 +664,30 @@ def export(request: dict) -> dict:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def probe_status(request: dict) -> dict:
+    """安装向导检测：列出账号目录，并用口令校验 contact.db（不解消息库、不写库）。"""
+    db_root = request.get("dbRoot") or DEFAULT_DB_ROOT
+    accounts: list[str] = []
+    if os.path.isdir(db_root):
+        for entry in sorted(os.listdir(db_root)):
+            contact = os.path.join(db_root, entry, "db_storage", "contact", "contact.db")
+            if os.path.isfile(contact):
+                accounts.append(entry)
+
+    key_hex = (request.get("keyHex") or "").strip().lower().removeprefix("0x")
+    matched = ""
+    if len(key_hex) == 64:
+        passphrase = bytes.fromhex(key_hex)
+        account = request.get("account")
+        if account and _key_ok(
+                os.path.join(db_root, account, "db_storage", "contact", "contact.db"),
+                passphrase):
+            matched = account
+        else:
+            matched = _pick_account(db_root, passphrase) or ""
+    return {"accounts": accounts, "account": matched}
+
+
 def probe_sessions(request: dict) -> dict:
     """只解密 session.db，返回关注会话的最后消息时间（不读消息库、不写库）。"""
     key_hex = (request.get("keyHex") or "").strip().lower().removeprefix("0x")
@@ -736,7 +760,9 @@ def main() -> int:
         raw = sys.stdin.read()
         request = json.loads(raw) if raw.strip() else {}
         probe = request.get("probe")
-        if probe == "session":
+        if probe == "status":
+            result = probe_status(request)
+        elif probe == "session":
             result = probe_sessions(request)
         elif probe == "avatars":
             result = probe_avatars(request)
