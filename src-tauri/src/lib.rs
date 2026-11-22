@@ -1961,9 +1961,16 @@ pub fn run() {
 
             // 启动时先同步一次，让界面直接拿到真实群/消息；
             // 失败不影响窗口打开，错误会通过 source_status 交给前端提示。
+            // Windows 首次启动需要扫描微信进程内存并解密，放在后台由向导触发，
+            // 避免窗口出现前长时间无响应。
             let source = wechat::SourceState::new(resolve_sidecar_dir(app.handle()));
-            let result = wechat::sync(&mut conn, &source.sidecar_dir);
-            record_sync_result(&source, &result);
+            #[cfg(not(target_os = "windows"))]
+            {
+                let result = wechat::sync(&mut conn, &source.sidecar_dir);
+                record_sync_result(&source, &result);
+            }
+            #[cfg(target_os = "windows")]
+            let _ = &mut conn;
 
             app.manage(DbState(Mutex::new(conn)));
             app.manage(DataDirState(data_dir));

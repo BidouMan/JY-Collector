@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sqlcipher4 as sc
 import wal as walmod
+import windows_keys
 from wechat_msg import ZSTD_MAGIC, _maybe_zstd, decode_content, _xml_field
 
 DEFAULT_DB_ROOT = os.path.expanduser(
@@ -55,6 +56,145 @@ def _derive(passphrase: bytes, salt: bytes) -> tuple[bytes, bytes]:
     return enc_key, hmac_key
 
 
+def _has_account(root: str) -> bool:
+    if not root or not os.path.isdir(root):
+        return False
+    try:
+        for entry in os.listdir(root):
+            if os.path.isfile(
+                    os.path.join(root, entry, "db_storage", "contact", "contact.db")):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _windows_db_root() -> str:
+    """Windows 默认 Documents\\xwechat_files；也读取微信配置里的自定义位置。"""
+    candidates: list[str] = []
+    env = os.environ.get("JY_WECHAT_DB_ROOT", "").strip()
+    if env:
+        candidates.append(env)
+    home = os.path.expanduser("~")
+    candidates.append(os.path.join(home, "Documents", "xwechat_files"))
+    candidates.append(os.path.join(home, "OneDrive", "Documents", "xwechat_files"))
+
+    appdata = os.environ.get("APPDATA", "")
+    config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
+    if appdata and os.path.isdir(config_dir):
+        try:
+            for name in os.listdir(config_dir):
+                if not name.lower().endswith(".ini"):
+                    continue
+                try:
+                    with open(os.path.join(config_dir, name), "r",
+                              encoding="utf-8", errors="ignore") as file:
+                        text = file.read()
+                except OSError:
+                    continue
+                for match in re.finditer(r"([A-Za-z]:[\\/][^\r\n\"']*)", text):
+                    raw = match.group(1).strip().rstrip("\\/")
+                    candidates.append(raw)
+                    candidates.append(os.path.join(raw, "xwechat_files"))
+        except OSError:
+            pass
+
+    for candidate in candidates:
+        if _has_account(candidate):
+            return candidate
+    return candidates[0] if candidates else os.path.join(
+        home, "Documents", "xwechat_files")
+
+
+def resolve_db_root(request: dict) -> str:
+    """请求里带了有效目录就用它；否则按平台自动探测。"""
+    root = (request.get("dbRoot") or "").strip()
+    if root and os.path.isdir(root):
+        if sys.platform != "win32" or _has_account(root):
+            return root
+        detected = _windows_db_root()
+        return detected if _has_account(detected) else root
+    if sys.platform == "win32":
+        return _windows_db_root()
+    return root or DEFAULT_DB_ROOT
+
+
+class KeyRing:
+    """按数据库提供 (enc_key, hmac_key)。
+
+    macOS：单个口令对每个库走 PBKDF2 派生。
+    Windows：WCDB 在内存里缓存的是每个库派生后的原始 enc_key，按库的 salt 匹配，
+    不再做 PBKDF2；找不到时用首页 HMAC 校验兜底。
+    """
+
+    def __init__(self, key_hex: str = ""):
+        key_hex = (key_hex or "").strip().lower().removeprefix("0x")
+        self._passphrase = bytes.fromhex(key_hex) if len(key_hex) == 64 else None
+        if self._passphrase is None and sys.platform != "win32":
+            raise RuntimeError("密钥格式不正确（需要 32 字节口令）")
+        self._pairs: dict[str, str] | None = None
+        self._cache: dict[str, tuple[bytes, bytes]] = {}
+
+    def _windows_pairs(self) -> dict[str, str]:
+        if self._pairs is None:
+            pairs: dict[str, str] = {}
+            for salt_hex, key_hex in windows_keys.scan_key_pairs():
+                pairs.setdefault(salt_hex, key_hex)
+            if not pairs:
+                raise RuntimeError("未从微信进程读取到数据库密钥")
+            self._pairs = pairs
+        return self._pairs
+
+    def ensure(self) -> None:
+        """Windows 下提前扫描内存；密钥不可用时抛出可读错误。"""
+        if self._passphrase is None:
+            self._windows_pairs()
+
+    def _match_key(self, db_path: str, salt: bytes) -> tuple[str, bool]:
+        """返回 (key_hex, 是否原始密钥)。兼容缓存里存原始密钥或口令两种情况。"""
+        pairs = self._windows_pairs()
+        salt_hex = salt.hex()
+        salt_match = pairs.get(salt_hex)
+        ordered: list[str] = []
+        if salt_match:
+            ordered.append(salt_match)
+        ordered.extend(key for key in pairs.values() if key not in ordered)
+        page: bytes | None = None
+        for key_hex in ordered:
+            key = bytes.fromhex(key_hex)
+            if page is None:
+                with open(db_path, "rb") as file:
+                    page = file.read(PAGE)
+            if len(page) != PAGE:
+                break
+            _, raw_hmac = sc.derive_keys(key, salt)
+            if sc.verify_page(page, 1, raw_hmac):
+                return key_hex, True
+        # 少数版本缓存的是口令而不是派生后的密钥；仅对 salt 匹配项尝试，避免拖慢。
+        if salt_match:
+            key = bytes.fromhex(salt_match)
+            _, pass_hmac = _derive(key, salt)
+            with open(db_path, "rb") as file:
+                page = file.read(PAGE)
+            if len(page) == PAGE and sc.verify_page(page, 1, pass_hmac):
+                return salt_match, False
+        raise RuntimeError("没有找到这个数据库的密钥，请确认微信已登录后重试")
+
+    def keys(self, db_path: str) -> tuple[bytes, bytes]:
+        cached = self._cache.get(db_path)
+        if cached is not None:
+            return cached
+        salt = sc.read_salt(db_path)
+        if self._passphrase is not None:
+            derived = _derive(self._passphrase, salt)
+        else:
+            key_hex, is_raw = self._match_key(db_path, salt)
+            key = bytes.fromhex(key_hex)
+            derived = sc.derive_keys(key, salt) if is_raw else _derive(key, salt)
+        self._cache[db_path] = derived
+        return derived
+
+
 def _read_pages(path: str) -> dict[int, bytes]:
     pages: dict[int, bytes] = {}
     with open(path, "rb") as f:
@@ -70,10 +210,9 @@ def _read_pages(path: str) -> dict[int, bytes]:
     return pages
 
 
-def _decrypt_to(db_path: str, out_path: str, passphrase: bytes) -> int:
+def _decrypt_to(db_path: str, out_path: str, keys: KeyRing) -> int:
     """解密整库到临时文件，返回 HMAC 校验失败的页数。"""
-    salt = sc.read_salt(db_path)
-    enc_key, hmac_key = _derive(passphrase, salt)
+    enc_key, hmac_key = keys.keys(db_path)
     pages = _read_pages(db_path)
     bad = 0
     with open(out_path, "wb") as f:
@@ -96,10 +235,9 @@ def _tables(con: sqlite3.Connection) -> list[str]:
         "SELECT name FROM sqlite_master WHERE type='table'")]
 
 
-def _key_ok(db_path: str, passphrase: bytes) -> bool:
+def _key_ok(db_path: str, keys: KeyRing) -> bool:
     try:
-        salt = sc.read_salt(db_path)
-        _, hmac_key = _derive(passphrase, salt)
+        _, hmac_key = keys.keys(db_path)
         with open(db_path, "rb") as f:
             page = f.read(PAGE)
         return len(page) == PAGE and sc.verify_page(page, 1, hmac_key)
@@ -107,12 +245,12 @@ def _key_ok(db_path: str, passphrase: bytes) -> bool:
         return False
 
 
-def _pick_account(db_root: str, passphrase: bytes) -> str | None:
+def _pick_account(db_root: str, keys: KeyRing) -> str | None:
     if not os.path.isdir(db_root):
         return None
     for entry in sorted(os.listdir(db_root)):
         contact = os.path.join(db_root, entry, "db_storage", "contact", "contact.db")
-        if os.path.isfile(contact) and _key_ok(contact, passphrase):
+        if os.path.isfile(contact) and _key_ok(contact, keys):
             return entry
     return None
 
@@ -387,7 +525,7 @@ def _load_sender_ids(con: sqlite3.Connection) -> dict[int, str]:
 
 
 def _load_image_md5(
-    storage: str, tmp_dir: str, passphrase: bytes
+    storage: str, tmp_dir: str, keys: KeyRing
 ) -> dict[tuple[str, int], str]:
     """从 message_resource.db 建立 (群/联系人, local_id) -> 图片文件 md5 的映射。
 
@@ -399,7 +537,7 @@ def _load_image_md5(
         return {}
     try:
         plain = os.path.join(tmp_dir, "message_resource.db")
-        bad = _decrypt_to(src, plain, passphrase)
+        bad = _decrypt_to(src, plain, keys)
         if bad:
             log(f"消息资源库有 {bad} 页校验失败，已跳过图片索引")
             return {}
@@ -440,7 +578,7 @@ def _image_mime(blob: bytes) -> str | None:
     return None
 
 
-def _load_avatars(storage: str, tmp_dir: str, passphrase: bytes) -> list[dict]:
+def _load_avatars(storage: str, tmp_dir: str, keys: KeyRing) -> list[dict]:
     """读取头像库（与消息库同一口令），返回可直接展示的头像列表。
 
     头像库属于缓存数据，缺失、版本差异或个别页校验失败都不应阻断采集，
@@ -451,7 +589,7 @@ def _load_avatars(storage: str, tmp_dir: str, passphrase: bytes) -> list[dict]:
         return []
     try:
         plain = os.path.join(tmp_dir, "head_image.db")
-        bad = _decrypt_to(src, plain, passphrase)
+        bad = _decrypt_to(src, plain, keys)
         if bad:
             log(f"头像库有 {bad} 页校验失败，已跳过头像")
             return []
@@ -479,7 +617,7 @@ def _load_avatars(storage: str, tmp_dir: str, passphrase: bytes) -> list[dict]:
 
 
 def _load_contact_avatar_urls(
-    storage: str, tmp_dir: str, passphrase: bytes
+    storage: str, tmp_dir: str, keys: KeyRing
 ) -> list[dict]:
     """只解联系人库，取出头像 CDN 地址（群成员也能覆盖到）。"""
     src = os.path.join(storage, "contact", "contact.db")
@@ -487,7 +625,7 @@ def _load_contact_avatar_urls(
         return []
     try:
         plain = os.path.join(tmp_dir, "contact.db")
-        bad = _decrypt_to(src, plain, passphrase)
+        bad = _decrypt_to(src, plain, keys)
         if bad:
             log(f"联系人库有 {bad} 页校验失败，已跳过头像地址")
             return []
@@ -566,17 +704,14 @@ def _collect_messages(con: sqlite3.Connection, rooms: list[dict],
 
 
 def export(request: dict) -> dict:
-    key_hex = (request.get("keyHex") or "").strip().lower().removeprefix("0x")
-    if len(key_hex) != 64:
-        raise RuntimeError("密钥格式不正确（需要 32 字节口令）")
-    passphrase = bytes.fromhex(key_hex)
-    db_root = request.get("dbRoot") or DEFAULT_DB_ROOT
+    db_root = resolve_db_root(request)
     since = request.get("since") or {}
+    keys = KeyRing(request.get("keyHex") or "")
 
     account = request.get("account")
     if not account or not _key_ok(
-            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), passphrase):
-        account = _pick_account(db_root, passphrase)
+            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), keys):
+        account = _pick_account(db_root, keys)
     if not account:
         raise RuntimeError("未找到可用密钥解开的微信账号目录（密钥可能已失效）")
 
@@ -589,10 +724,10 @@ def export(request: dict) -> dict:
     try:
         plain_contact = os.path.join(tmp_dir, "contact.db")
         plain_session = os.path.join(tmp_dir, "session.db")
-        bad = _decrypt_to(os.path.join(storage, "contact", "contact.db"), plain_contact, passphrase)
+        bad = _decrypt_to(os.path.join(storage, "contact", "contact.db"), plain_contact, keys)
         if bad:
             raise RuntimeError("联系人库校验失败（密钥与库不匹配）")
-        _decrypt_to(os.path.join(storage, "session", "session.db"), plain_session, passphrase)
+        _decrypt_to(os.path.join(storage, "session", "session.db"), plain_session, keys)
 
         contact_con = _open_plain(plain_contact)
         contacts = _load_contacts(contact_con)
@@ -606,7 +741,7 @@ def export(request: dict) -> dict:
 
         all_messages: list[dict] = []
         active: dict[str, int] = {}
-        image_md5 = _load_image_md5(storage, tmp_dir, passphrase)
+        image_md5 = _load_image_md5(storage, tmp_dir, keys)
         shards = sorted(
             name for name in os.listdir(msg_dir)
             if re.fullmatch(r"message_\d+\.db", name)
@@ -617,7 +752,7 @@ def export(request: dict) -> dict:
         plain_shards: list[str] = []
         for shard in shards:
             plain_shard = os.path.join(tmp_dir, shard)
-            bad = _decrypt_to(os.path.join(msg_dir, shard), plain_shard, passphrase)
+            bad = _decrypt_to(os.path.join(msg_dir, shard), plain_shard, keys)
             if bad:
                 log(f"{shard} 有 {bad} 页校验失败，已跳过")
             plain_shards.append(plain_shard)
@@ -652,7 +787,7 @@ def export(request: dict) -> dict:
             )
 
         rooms.sort(key=lambda r: r["lastActive"], reverse=True)
-        avatars = _load_avatars(storage, tmp_dir, passphrase)
+        avatars = _load_avatars(storage, tmp_dir, keys)
         return {
             "account": account,
             "groups": rooms,
@@ -665,8 +800,8 @@ def export(request: dict) -> dict:
 
 
 def probe_status(request: dict) -> dict:
-    """安装向导检测：列出账号目录，并用口令校验 contact.db（不解消息库、不写库）。"""
-    db_root = request.get("dbRoot") or DEFAULT_DB_ROOT
+    """安装向导检测：列出账号目录，并校验 contact.db（不解消息库、不写库）。"""
+    db_root = resolve_db_root(request)
     accounts: list[str] = []
     if os.path.isdir(db_root):
         for entry in sorted(os.listdir(db_root)):
@@ -674,32 +809,55 @@ def probe_status(request: dict) -> dict:
             if os.path.isfile(contact):
                 accounts.append(entry)
 
+    result = {
+        "accounts": accounts,
+        "account": "",
+        "keyPresent": False,
+        "dbRoot": db_root,
+        "message": "",
+    }
+    if not accounts:
+        result["message"] = "还没有找到本机微信聊天记录，请先登录微信"
+        return result
+
     key_hex = (request.get("keyHex") or "").strip().lower().removeprefix("0x")
-    matched = ""
     if len(key_hex) == 64:
-        passphrase = bytes.fromhex(key_hex)
-        account = request.get("account")
-        if account and _key_ok(
-                os.path.join(db_root, account, "db_storage", "contact", "contact.db"),
-                passphrase):
-            matched = account
-        else:
-            matched = _pick_account(db_root, passphrase) or ""
-    return {"accounts": accounts, "account": matched}
+        keys = KeyRing(key_hex)
+        result["keyPresent"] = True
+    elif sys.platform == "win32":
+        keys = KeyRing("")
+        try:
+            keys.ensure()
+        except Exception as exc:  # noqa: BLE001 - 把可操作的原因交给界面
+            result["message"] = str(exc)
+            return result
+        result["keyPresent"] = True
+    else:
+        result["message"] = "还没有读取授权"
+        return result
+
+    account = request.get("account")
+    if account and _key_ok(
+            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), keys):
+        result["account"] = account
+    else:
+        result["account"] = _pick_account(db_root, keys) or ""
+    result["message"] = (
+        "已找到微信数据，可以开始同步" if result["account"]
+        else "找到了微信数据，但无法打开数据库，请重试"
+    )
+    return result
 
 
 def probe_sessions(request: dict) -> dict:
     """只解密 session.db，返回关注会话的最后消息时间（不读消息库、不写库）。"""
-    key_hex = (request.get("keyHex") or "").strip().lower().removeprefix("0x")
-    if len(key_hex) != 64:
-        raise RuntimeError("密钥格式不正确（需要 32 字节口令）")
-    passphrase = bytes.fromhex(key_hex)
-    db_root = request.get("dbRoot") or DEFAULT_DB_ROOT
+    db_root = resolve_db_root(request)
+    keys = KeyRing(request.get("keyHex") or "")
 
     account = request.get("account")
     if not account or not _key_ok(
-            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), passphrase):
-        account = _pick_account(db_root, passphrase)
+            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), keys):
+        account = _pick_account(db_root, keys)
     if not account:
         raise RuntimeError("未找到可用密钥解开的微信账号目录（密钥可能已失效）")
 
@@ -711,7 +869,7 @@ def probe_sessions(request: dict) -> dict:
     tmp_dir = tempfile.mkdtemp(prefix="jy-session-")
     try:
         plain = os.path.join(tmp_dir, "session.db")
-        bad = _decrypt_to(session_db, plain, passphrase)
+        bad = _decrypt_to(session_db, plain, keys)
         if bad:
             raise RuntimeError("会话库校验失败（密钥与库不匹配）")
         con = _open_plain(plain)
@@ -730,16 +888,13 @@ def probe_sessions(request: dict) -> dict:
 
 def probe_avatars(request: dict) -> dict:
     """只解密头像库，返回可展示的头像（不读消息库、不写库）。"""
-    key_hex = (request.get("keyHex") or "").strip().lower().removeprefix("0x")
-    if len(key_hex) != 64:
-        raise RuntimeError("密钥格式不正确（需要 32 字节口令）")
-    passphrase = bytes.fromhex(key_hex)
-    db_root = request.get("dbRoot") or DEFAULT_DB_ROOT
+    db_root = resolve_db_root(request)
+    keys = KeyRing(request.get("keyHex") or "")
 
     account = request.get("account")
     if not account or not _key_ok(
-            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), passphrase):
-        account = _pick_account(db_root, passphrase)
+            os.path.join(db_root, account, "db_storage", "contact", "contact.db"), keys):
+        account = _pick_account(db_root, keys)
     if not account:
         raise RuntimeError("未找到可用密钥解开的微信账号目录（密钥可能已失效）")
 
@@ -748,8 +903,8 @@ def probe_avatars(request: dict) -> dict:
     try:
         return {
             "account": account,
-            "avatars": _load_avatars(storage, tmp_dir, passphrase),
-            "avatarUrls": _load_contact_avatar_urls(storage, tmp_dir, passphrase),
+            "avatars": _load_avatars(storage, tmp_dir, keys),
+            "avatarUrls": _load_contact_avatar_urls(storage, tmp_dir, keys),
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

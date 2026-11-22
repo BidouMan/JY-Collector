@@ -40,6 +40,9 @@ const canFinish = computed(
   () => groups.value.length === 0 || groupIds.value.length > 0,
 );
 
+/** Windows 的“授权”实际是：登录微信后从进程内存取密钥。 */
+const isWindows = computed(() => status.value?.platform === "windows");
+
 const footerNote = computed(() => {
   if (step.value === 1) return "只检测本机微信数据与读取授权，不改动任何微信文件";
   if (step.value === 2) return "授权由本机钥匙串提供，口令不会显示在界面或写入仓库";
@@ -277,13 +280,16 @@ onBeforeUnmount(stopTimer);
             <template v-else-if="status?.authorized">
               本机已有可用授权，可以直接进入同步。
             </template>
+            <template v-else-if="isWindows">
+              {{ status?.message || "请先登录微信并保持运行，然后点“重新检测”。如果提示无法读取内存，请右键应用选择“以管理员身份运行”后再试。" }}
+            </template>
             <template v-else>
               这台电脑还没有可用的微信读取授权。完成本机授权后，点下方按钮重新检测。
             </template>
           </p>
           <p v-if="checkError" class="setup-error">{{ checkError }}</p>
           <p v-else-if="authAttempted && !status?.authorized" class="setup-message">
-            仍未检测到可用授权。完成本机授权后，再点一次“重新授权”。
+            仍未检测到可用授权。完成本机授权后，再点一次“{{ isWindows ? "重新检测" : "重新授权" }}”。
           </p>
           <button
             v-if="status?.supported && !status?.authorized"
@@ -291,7 +297,7 @@ onBeforeUnmount(stopTimer);
             :disabled="checking"
             @click="authorize"
           >
-            {{ checking ? "检测中…" : "重新授权" }}
+            {{ checking ? "检测中…" : isWindows ? "重新检测" : "重新授权" }}
           </button>
         </template>
 

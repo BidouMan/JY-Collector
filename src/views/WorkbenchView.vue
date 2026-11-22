@@ -44,7 +44,7 @@ const groupsOpen = ref(false);
 const scopeOpen = ref(false);
 const refreshing = ref(false);
 const dataUpdated = ref(false);
-/** 数据源不可用时的说明（例如 Windows 版暂不支持读取本机微信）。 */
+/** 数据源不可用时的说明（首次设置或读取失败）。 */
 const sourceNotice = ref("");
 /** 口令/密钥失效：给出“重新授权”入口，不弹全屏向导打断采集。 */
 const needsAuth = ref(false);
@@ -377,10 +377,10 @@ onMounted(async () => {
     const [groupList, status] = await Promise.all([collector.listGroups(), api.sourceStatus()]);
     groups.value = groupList;
     needsAuth.value = status.needsAuth;
-    if (!status.ready && status.lastError) {
-      // 没有会话时不弹报错，直接在左侧列表显示一条状态说明。
-      sourceNotice.value = status.lastError;
-      if (groups.value.length > 0) notify(status.lastError, "error");
+    if (!status.ready) {
+      // 数据尚未就绪时不自动触发同步，交给首次设置向导或用户点“刷新”。
+      sourceNotice.value = status.lastError || "微信数据尚未就绪，请完成首次设置或点击刷新";
+      if (groups.value.length > 0 && status.lastError) notify(status.lastError, "error");
       if (groups.value[0]) await selectGroup(groups.value[0]);
       return;
     }

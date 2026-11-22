@@ -33,6 +33,10 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -45,9 +49,26 @@ jobs:
       - name: Frontend typecheck and build
         run: npm run build
 
+      # 把 Python 采集/解密逻辑打成独立 exe，客户电脑不需要安装 Python。
+      - name: Build bundled sidecar
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --disable-pip-version-check pyinstaller
+          New-Item -ItemType Directory -Force -Path build/pyinstaller | Out-Null
+          python -m PyInstaller --noconfirm --clean --onefile `
+            --name wechat_sidecar `
+            --distpath src-tauri/sidecar `
+            --workpath build/pyinstaller `
+            --specpath build/pyinstaller `
+            src-tauri/sidecar/wechat_export.py
+          if (-not (Test-Path "src-tauri/sidecar/wechat_sidecar.exe")) {
+            throw "sidecar 打包失败"
+          }
+
       # 只打 NSIS（currentUser），不打 MSI，避免管理员权限与 WiX 依赖。
       - name: Build Tauri app
-        run: npx --no-install tauri build --bundles nsis
+        run: npx --no-install tauri build --bundles nsis --config src-tauri/tauri.windows.conf.json
 
       - name: Package artifacts
         id: meta
@@ -113,9 +134,13 @@ jobs:
 
           Win11 自带；Win10 多数随 Edge 预装。若启动提示缺少 WebView2，安装 Microsoft Edge WebView2 Runtime（Evergreen Bootstrapper）后再启动。
 
-          ## Windows 暂不可用的功能
+          ## 读取本机微信数据
 
-          “从本机微信读取并解密聊天记录”尚未实现，采集页会显示一条状态说明，不会崩溃或白屏。记录、记录表、台账导出、设置等界面可以正常打开；由于暂无数据源，会话与消息列表为空。
+          1. 先登录电脑版微信（4.x，进程名 Weixin.exe）并保持运行。
+          2. 打开应用，按首次设置向导完成检测、授权、同步、选择会话。
+          3. 若提示无法读取微信进程内存，请关闭应用，右键选择“以管理员身份运行”后重新检测。
+
+          说明：仅支持微信 4.x；采集组件已内置，不需要安装 Python；文字消息、会话和头像可正常采集，图片暂可能显示占位。
 
           ## 校验下载
 

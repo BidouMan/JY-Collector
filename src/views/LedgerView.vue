@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import Sortable from "sortablejs";
 import { api, type SheetColumnPayload } from "../api";
 import DropdownSelect from "../components/DropdownSelect.vue";
 import SheetGrid from "../components/SheetGrid.vue";
@@ -59,23 +58,7 @@ const widthCacheKey = computed(() =>
       : "",
 );
 
-interface ColumnDraft {
-  uid: number;
-  source: number;
-  label: string;
-  hint: string;
-  width: number;
-  format: ColumnFormat;
-  options: string[];
-}
-
-const columnEditorOpen = ref(false);
-const columnDrafts = ref<ColumnDraft[]>([]);
-const columnBusy = ref(false);
 const columnOpBusy = ref(false);
-const columnListRef = ref<HTMLElement | null>(null);
-let columnSortable: Sortable | null = null;
-let columnSeq = 0;
 
 const editingRow = ref<number | null>(null);
 const draftValues = ref<string[]>([]);
@@ -391,127 +374,6 @@ const visibleRows = computed(() => {
   const start = (page.value - 1) * PAGE_SIZE;
   return filteredRows.value.slice(start, start + PAGE_SIZE);
 });
-
-function openColumnEditor() {
-  if (headers.value.length === 0) {
-    notify("请先在设置里配置导出列", "error");
-    return;
-  }
-  const template = templates.value.find((item) => item.id === templateId.value);
-  const sheetMeta = template?.sheets.find(
-    (sheet) => sheet.name === activeDataSheet.value,
-  );
-  columnDrafts.value = headers.value.map((label, index) => {
-    const meta = sheetMeta?.columns[index] ?? template?.columns[index];
-    return {
-      uid: ++columnSeq,
-      source: index + 1,
-      label,
-      hint: meta?.hint ?? "",
-      width: meta?.width ?? 18,
-      format: (meta?.format as ColumnFormat) ?? "text",
-      options: meta?.options ?? [],
-    };
-  });
-  columnEditorOpen.value = true;
-}
-
-function closeColumnEditor() {
-  columnEditorOpen.value = false;
-  columnDrafts.value = [];
-  columnSortable?.destroy();
-  columnSortable = null;
-}
-
-function addColumnDraft() {
-  columnDrafts.value.push({
-    uid: ++columnSeq,
-    source: 0,
-    label: "",
-    hint: "",
-    width: 18,
-    format: "text",
-    options: [],
-  });
-}
-
-function removeColumnDraft(uid: number) {
-  if (columnDrafts.value.length <= 1) {
-    notify("至少保留一列", "error");
-    return;
-  }
-  columnDrafts.value = columnDrafts.value.filter((draft) => draft.uid !== uid);
-}
-
-function initColumnSortable() {
-  columnSortable?.destroy();
-  columnSortable = null;
-  const el = columnListRef.value;
-  if (!el) return;
-  columnSortable = Sortable.create(el, {
-    handle: ".drag-handle",
-    animation: 200,
-    easing: "cubic-bezier(0.22, 1, 0.36, 1)",
-    ghostClass: "drag-ghost",
-    chosenClass: "drag-chosen",
-    dragClass: "drag-active",
-    fallbackClass: "drag-fallback",
-    forceFallback: true,
-    fallbackOnBody: true,
-    fallbackTolerance: 3,
-    onStart() {
-      el.classList.add("is-sorting");
-    },
-    onEnd(event) {
-      el.classList.remove("is-sorting");
-      window.getSelection()?.removeAllRanges();
-      const { oldIndex, newIndex } = event;
-      if (oldIndex == null || newIndex == null || oldIndex === newIndex) return;
-      const [moved] = columnDrafts.value.splice(oldIndex, 1);
-      if (moved) columnDrafts.value.splice(newIndex, 0, moved);
-    },
-  });
-}
-
-watch(columnListRef, initColumnSortable, { flush: "post" });
-
-async function saveColumnSettings() {
-  if (columnBusy.value) return;
-  const drafts = columnDrafts.value;
-  if (drafts.length === 0) {
-    notify("至少保留一列", "error");
-    return;
-  }
-  const labels = drafts.map((draft) => draft.label.trim());
-  if (labels.some((label) => !label)) {
-    notify("列名不能为空", "error");
-    return;
-  }
-  const payload = drafts.map((draft) => ({
-    source: draft.source,
-    label: draft.label.trim(),
-    hint: draft.hint.trim(),
-    width: Math.min(80, Math.max(6, Number(draft.width) || 18)),
-    format: draft.format,
-    options: draft.options,
-  }));
-  columnBusy.value = true;
-  try {
-    await queueWrite(() =>
-      api.saveSheetColumns(templateId.value, activeDataSheet.value, payload),
-    );
-    await refreshTemplates();
-    gridRef.value?.resetWidths();
-    clearHistory();
-    await reload(false);
-    closeColumnEditor();
-    notify("列设置已保存");
-  } catch (error) {
-    notify(String(error), "error");
-  } finally {
-    columnBusy.value = false;
-  }
-}
 
 async function refreshTemplates() {
   templates.value = await api.listTemplates();
@@ -919,11 +781,6 @@ async function deleteMenuRows() {
 function replaceFromMenu() {
   closeCellMenu();
   replaceOpen.value = true;
-}
-
-function columnSettingsFromMenu() {
-  closeCellMenu();
-  openColumnEditor();
 }
 
 function freezeFromMenu() {
@@ -1503,8 +1360,6 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onGlobalKeydown);
   window.clearTimeout(deleteTimer);
-  columnSortable?.destroy();
-  columnSortable = null;
 });
 </script>
 
@@ -1557,13 +1412,18 @@ onBeforeUnmount(() => {
         @rename="renameDataSheet"
       />
       <div class="table-view-bar">
-        <ViewRulesBar
-          :headers="headers"
-          :keys="dataKeys"
-          :formats="dataFormats"
-          :config="viewConfig"
-          @change="applyViewConfig"
-        />
+        <div class="view-left">
+          <ViewRulesBar
+            :headers="headers"
+            :keys="dataKeys"
+            :formats="dataFormats"
+            :config="viewConfig"
+            @change="applyViewConfig"
+          />
+          <button class="btn small" type="button" @click="replaceOpen = true">
+            替换
+          </button>
+        </div>
         <div class="view-search">
           <input
             v-model="keyword"
@@ -1655,13 +1515,6 @@ onBeforeUnmount(() => {
         <button class="col-menu-item danger" @click="deleteMenuRows">删除行</button>
         <div class="col-menu-sep"></div>
         <button class="col-menu-item" @click="replaceFromMenu">替换…</button>
-        <button
-          class="col-menu-item"
-          :disabled="loading || headers.length === 0"
-          @click="columnSettingsFromMenu"
-        >
-          列设置…
-        </button>
         <div class="col-menu-sep"></div>
         <button class="col-menu-item" @click="freezeFromMenu">
           冻结首列{{ viewConfig.freezeFirstColumn ? " ✓" : "" }}
@@ -1784,67 +1637,6 @@ onBeforeUnmount(() => {
             @click="runReplace"
           >
             {{ replaceBusy ? "替换中…" : "全部替换" }}
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div v-if="columnEditorOpen" class="modal-backdrop">
-      <div class="modal wide">
-        <div class="modal-head">
-          <div>
-            <div class="modal-title">列设置</div>
-            <div class="page-sub">
-              {{ table?.sheet }} · {{ columnDrafts.length }} 列
-            </div>
-          </div>
-          <button class="text-btn" @click="closeColumnEditor">关闭</button>
-        </div>
-        <div class="modal-body column-settings-body">
-          <div class="template-col-row head">
-            <span></span>
-            <span>列名</span>
-            <span>示例</span>
-            <span>格式</span>
-            <span></span>
-          </div>
-          <div ref="columnListRef" class="template-col-list">
-            <div
-              v-for="draft in columnDrafts"
-              :key="draft.uid"
-              class="template-col-row"
-            >
-              <span class="drag-handle">⠿</span>
-              <input v-model="draft.label" class="field-input" placeholder="列名" />
-              <input v-model="draft.hint" class="field-input" placeholder="示例值" />
-              <select v-model="draft.format" class="field-input">
-                <option value="text">文本</option>
-                <option value="number">数字</option>
-                <option value="date">日期</option>
-                <option value="select">单选</option>
-                <option value="multi_select">多选</option>
-              </select>
-              <div class="row-actions">
-                <button class="text-btn" @click="removeColumnDraft(draft.uid)">
-                  删除
-                </button>
-              </div>
-            </div>
-          </div>
-          <div class="row-actions template-actions">
-            <button class="btn small" @click="addColumnDraft">新增列</button>
-          </div>
-        </div>
-        <div class="modal-foot">
-          <button class="btn" :disabled="columnBusy" @click="closeColumnEditor">
-            取消
-          </button>
-          <button
-            class="btn primary"
-            :disabled="columnBusy"
-            @click="saveColumnSettings"
-          >
-            {{ columnBusy ? "保存中…" : "保存" }}
           </button>
         </div>
       </div>

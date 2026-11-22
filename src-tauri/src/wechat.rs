@@ -32,14 +32,6 @@ use std::time::{Duration, Instant};
 const KEYCHAIN_SERVICE: &str = "jycollector.wechat.key";
 const KEYCHAIN_ACCOUNT: &str = "wechat-macos";
 
-/// Windows 版尚未实现本机微信数据源（取密钥、解密、权限流程都在 macOS 侧）。
-/// 返回统一的友好提示，让界面显示一条简洁说明而不是多层报错。
-#[cfg(target_os = "windows")]
-const SOURCE_UNAVAILABLE: Option<&str> =
-    Some("Windows 版暂不支持读取本机微信数据，其他功能可正常使用");
-#[cfg(not(target_os = "windows"))]
-const SOURCE_UNAVAILABLE: Option<&str> = None;
-
 pub struct SourceState {
     pub sidecar_dir: PathBuf,
     pub status: Mutex<SourceStatusDto>,
@@ -82,10 +74,112 @@ const CHECK_DEBOUNCE: Duration = Duration::from_secs(20);
 /// 两次增量解密之间的最小间隔。
 const CHECK_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn default_db_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     Path::new(&home)
         .join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
+}
+
+/// Windows：微信 4.x 默认把数据放在 `文档\xwechat_files`。
+/// 用户改过存储位置时，从 `%APPDATA%\Tencent\xwechat\config\*.ini` 里读取路径。
+#[cfg(target_os = "windows")]
+pub(crate) fn default_db_root() -> PathBuf {
+    if let Ok(path) = std::env::var("JY_WECHAT_DB_ROOT") {
+        let candidate = PathBuf::from(path);
+        if has_account_root(&candidate) {
+            return candidate;
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join("Documents").join("xwechat_files"));
+        candidates.push(home.join("OneDrive").join("Documents").join("xwechat_files"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let config = PathBuf::from(appdata)
+            .join("Tencent")
+            .join("xwechat")
+            .join("config");
+        if let Ok(entries) = std::fs::read_dir(&config) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_ini = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.eq_ignore_ascii_case("ini"))
+                    .unwrap_or(false);
+                if !is_ini {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                candidates.extend(ini_paths(&text));
+            }
+        }
+    }
+    for letter in b'C'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        candidates.push(Path::new(&drive).join("xwechat_files"));
+        candidates.push(Path::new(&drive).join("Documents").join("xwechat_files"));
+    }
+
+    candidates
+        .iter()
+        .find(|candidate| has_account_root(candidate))
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "windows")]
+fn has_account_root(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .join("db_storage/contact/contact.db")
+            .is_file()
+    })
+}
+
+/// 从微信配置里提取形如 `D:\目录` 的路径；同时尝试它下面的 xwechat_files。
+#[cfg(target_os = "windows")]
+fn ini_paths(text: &str) -> Vec<PathBuf> {
+    let bytes = text.as_bytes();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        let current = bytes[index];
+        let is_drive = current.is_ascii_alphabetic()
+            && bytes[index + 1] == b':'
+            && (bytes[index + 2] == b'\\' || bytes[index + 2] == b'/');
+        if !is_drive {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 2;
+        while end < bytes.len() {
+            if matches!(bytes[end], b'\r' | b'\n' | b'"' | b'\'' | b'\0' | b';') {
+                break;
+            }
+            end += 1;
+        }
+        let raw = String::from_utf8_lossy(&bytes[index..end]);
+        let trimmed = raw.trim().trim_end_matches(['\\', '/']);
+        if trimmed.len() > 3 {
+            let base = PathBuf::from(trimmed);
+            paths.push(base.clone());
+            paths.push(base.join("xwechat_files"));
+        }
+        index = end.max(index + 3);
+    }
+    paths
 }
 
 /// 本机微信账号目录（存在 contact.db 才算有效账号），只做目录检查。
@@ -114,9 +208,62 @@ pub fn setup_status(sidecar_dir: &Path) -> SetupStatusDto {
         ..Default::default()
     };
     if cfg!(target_os = "windows") {
-        status.state = "unsupported".to_string();
-        status.message = "Windows 版暂不支持读取本机微信数据，可以继续完成其他设置".to_string();
-        return status;
+        status.supported = true;
+        let request = serde_json::json!({
+            "probe": "status",
+            "dbRoot": default_db_root().to_string_lossy(),
+        });
+        return match run_sidecar_json(sidecar_dir, &request) {
+            Ok(value) => {
+                let account = value
+                    .get("account")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let message = value
+                    .get("message")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                status.account_count = value
+                    .get("accounts")
+                    .and_then(|item| item.as_array())
+                    .map(|items| items.len() as i64)
+                    .unwrap_or(0);
+                status.data_found = status.account_count > 0;
+                status.key_present = value
+                    .get("keyPresent")
+                    .and_then(|item| item.as_bool())
+                    .unwrap_or(false);
+                if account.is_empty() {
+                    status.state = if status.data_found {
+                        "needs_auth".to_string()
+                    } else {
+                        "no_data".to_string()
+                    };
+                    status.message = if message.is_empty() {
+                        "还没有找到可读取的微信数据".to_string()
+                    } else {
+                        message
+                    };
+                } else {
+                    status.account = account;
+                    status.authorized = true;
+                    status.state = "ready".to_string();
+                    status.message = if message.is_empty() {
+                        "已找到微信数据，可以开始同步".to_string()
+                    } else {
+                        message
+                    };
+                }
+                status
+            }
+            Err(message) => {
+                status.state = "error".to_string();
+                status.message = message;
+                status
+            }
+        };
     }
 
     status.supported = true;
@@ -180,6 +327,8 @@ pub fn is_auth_error(message: &str) -> bool {
         "数据目录",
         "账号目录",
         "未找到微信数据",
+        "微信进程",
+        "管理员",
     ]
     .iter()
     .any(|word| message.contains(word))
@@ -362,10 +511,7 @@ pub fn session_last_timestamps(
     account: &str,
     watched: &[String],
 ) -> Result<HashMap<String, i64>, String> {
-    if let Some(message) = SOURCE_UNAVAILABLE {
-        return Err(message.to_string());
-    }
-    let key_hex = load_key_hex()?;
+    let key_hex = source_key()?;
     let request = serde_json::json!({
         "probe": "session",
         "keyHex": key_hex,
@@ -388,10 +534,7 @@ pub struct AvatarSnapshot {
 
 /// 只解头像库与联系人库，返回本地头像与头像 CDN 地址（不读消息库、不写库）。
 pub fn avatar_snapshot(sidecar_dir: &Path, account: &str) -> Result<AvatarSnapshot, String> {
-    if let Some(message) = SOURCE_UNAVAILABLE {
-        return Err(message.to_string());
-    }
-    let key_hex = load_key_hex()?;
+    let key_hex = source_key()?;
     let request = serde_json::json!({
         "probe": "avatars",
         "keyHex": key_hex,
@@ -471,6 +614,17 @@ fn resolve_python() -> String {
     std::env::var("JY_PYTHON").unwrap_or_else(|_| "python3".to_string())
 }
 
+/// macOS 从钥匙串读口令；Windows 由 sidecar 从微信进程内存读取每个库的密钥。
+#[cfg(target_os = "macos")]
+fn source_key() -> Result<String, String> {
+    load_key_hex()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn source_key() -> Result<String, String> {
+    Ok(String::new())
+}
+
 fn last_error_line(stderr: &str) -> String {
     stderr
         .lines()
@@ -487,24 +641,60 @@ fn run_sidecar(sidecar_dir: &Path, request: &serde_json::Value) -> Result<WxExpo
         .map_err(|_| "采集结果解析失败（微信版本可能已变更）".to_string())
 }
 
+/// 采集进程：优先使用随包分发的独立 sidecar（Windows 无 Python 也能跑），
+/// 其次才回退到开发机的 python3。
+fn sidecar_program(sidecar_dir: &Path) -> (PathBuf, bool) {
+    let name = if cfg!(target_os = "windows") {
+        "wechat_sidecar.exe"
+    } else {
+        "wechat_sidecar"
+    };
+    let bundled = sidecar_dir.join(name);
+    if bundled.is_file() {
+        return (bundled, true);
+    }
+    if let Ok(path) = std::env::var("JY_SIDECAR_EXE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return (path, true);
+        }
+    }
+    (PathBuf::from(resolve_python()), false)
+}
+
 fn run_sidecar_json(
     sidecar_dir: &Path,
     request: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let script = sidecar_dir.join("wechat_export.py");
-    if !script.is_file() {
+    let (program, is_exe) = sidecar_program(sidecar_dir);
+    if !is_exe && !script.is_file() {
         return Err(format!("采集脚本缺失：{}", script.display()));
     }
 
-    let mut child = Command::new(resolve_python())
-        .arg(&script)
+    let mut command = Command::new(&program);
+    if !is_exe {
+        command.arg(&script).env("PYTHONDONTWRITEBYTECODE", "1");
+    }
+    command
         .current_dir(sidecar_dir)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| "未找到 python3，无法启动微信采集进程".to_string())?;
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // 后台采集不弹出控制台窗口。
+        command.creation_flags(0x0800_0000);
+    }
+
+    let mut child = command.spawn().map_err(|_| {
+        if is_exe {
+            "采集组件缺失，请重新安装应用".to_string()
+        } else {
+            "未找到 python3，无法启动微信采集进程".to_string()
+        }
+    })?;
 
     {
         let stdin = child
@@ -536,11 +726,8 @@ pub fn sync(
     conn: &mut rusqlite::Connection,
     sidecar_dir: &Path,
 ) -> Result<SyncSummaryDto, String> {
-    if let Some(message) = SOURCE_UNAVAILABLE {
-        return Err(message.to_string());
-    }
     let started = std::time::Instant::now();
-    let key_hex = load_key_hex()?;
+    let key_hex = source_key()?;
 
     let stored_version = crate::db::setting_value(conn, "wechat_pipeline_version")
         .map_err(|e| e.to_string())?;

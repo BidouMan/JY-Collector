@@ -1221,6 +1221,13 @@ mark {
   background: var(--panel);
 }
 
+.view-left {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
 .view-search {
   display: flex;
   align-items: center;
@@ -3039,10 +3046,6 @@ body.col-resizing {
   gap: 8px;
   align-items: center;
   padding: 7px 0;
-}
-
-.column-settings-body .template-col-row {
-  grid-template-columns: 18px minmax(0, 1.2fr) minmax(0, 1.2fr) 84px minmax(0, auto);
 }
 
 .template-col-list {
